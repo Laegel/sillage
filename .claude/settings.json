@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/guard-scope.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|gh pr create",
+        "hooks": [
+          { "type": "command", "command": "node .claude/hooks/notify-pr.js" }
+        ]
+      },
+      {
+        "matcher": "mcp__github__.*",
+        "hooks": [
+          { "type": "command", "command": "node .claude/hooks/notify-pr.js" }
+        ]
+      }
+    ]
+  }
+}

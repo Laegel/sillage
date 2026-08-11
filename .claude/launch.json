@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pilot",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["./orchestrator.sh"],
+      "port": 5173
+    }
+  ]
+}
