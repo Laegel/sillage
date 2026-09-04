@@ -74,6 +74,11 @@ export function fetchDesignPreview(sessionId: string, projectId: string, issueId
   return request(`/api/design/${sessionId}/preview?${params}`)
 }
 
+export function fetchDesignControls(sessionId: string, projectId: string, issueId?: string): Promise<{ html: string | null }> {
+  const params = new URLSearchParams({ projectId, ...(issueId ? { issueId } : {}) })
+  return request(`/api/design/${sessionId}/controls?${params}`)
+}
+
 export function fetchPlans(issueId: string): Promise<{ plans: Plan[] }> {
   return request(`/api/plans?issueId=${encodeURIComponent(issueId)}`)
 }

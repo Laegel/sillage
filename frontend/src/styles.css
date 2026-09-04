@@ -1,16 +1,26 @@
 :root {
   color-scheme: dark;
-  --bg: #0f1115;
-  --panel: #171a21;
-  --panel-2: #1d2129;
-  --border: #2a2f3a;
+  --bg: #101113;
+  --panel: #17181b;
+  --panel-2: #1d1f23;
+  --border: #2b2d33;
   --text: #e6e9ef;
-  --muted: #8b93a3;
-  --accent: #7c5cff;
-  --accent-2: #4f8cff;
-  --green: #3fb97f;
+  --muted: #8b8f99;
+  --accent: #22c55e;
+  --accent-2: #4ade80;
+  --green: #2f9e63;
   --red: #e5534b;
   --amber: #e2a13b;
+  /* dataviz skill's validated dark-mode categorical slots (references/palette.md),
+     fixed order — never cycled/reassigned per project, indexed by stable project order */
+  --project-color-0: #3987e5;
+  --project-color-1: #199e70;
+  --project-color-2: #c98500;
+  --project-color-3: #008300;
+  --project-color-4: #9085e9;
+  --project-color-5: #e66767;
+  --project-color-6: #d55181;
+  --project-color-7: #d95926;
 }
 
 * {
@@ -19,7 +29,7 @@
 
 body {
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
@@ -33,12 +43,24 @@ body {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin: -16px -16px 16px;
+  padding: 14px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
 }
 
 .app-header h1 {
   margin: 0;
   font-size: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
 }
 
 .muted {
@@ -69,12 +91,37 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 1fr 300px;
+  /* minmax(0, 1fr), not bare 1fr: a bare 1fr track's automatic minimum is
+     content-based ("auto"), so wide non-shrinking content (long unbroken
+     tool-output lines, wide kanban content, etc.) pushes the whole grid past
+     the viewport. minmax(0, 1fr) caps that minimum at 0 so the column
+     actually shrinks to fit instead. Single column now that the task panel
+     is a <dialog> overlay rather than a grid participant. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
 }
 
-.tracker {
-  grid-column: 1;
+.view-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.view-tabs button {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--muted);
+  border-radius: 7px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 13.5px;
+  transition: color 0.15s;
+}
+
+.view-tabs button.active {
+  border-color: var(--accent);
+  background: #22c55e14;
+  color: var(--accent-2);
+  font-weight: 500;
 }
 
 .create-form {
@@ -99,7 +146,7 @@ body {
 .create-form button {
   background: var(--accent);
   border: none;
-  color: white;
+  color: var(--bg);
   padding: 9px 16px;
   border-radius: 8px;
   cursor: pointer;
@@ -132,6 +179,18 @@ body {
 .project-filter select {
   flex: initial;
   min-width: 160px;
+}
+
+.tracker-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  padding: 20px 0;
+}
+
+.tracker-error {
+  color: var(--red);
 }
 
 .columns {
@@ -192,6 +251,12 @@ body {
 
 .issue-card.running {
   opacity: 0.7;
+}
+
+.issue-card.is-subissue {
+  margin-left: 14px;
+  width: calc(100% - 14px);
+  border-left: 2px solid var(--accent-2);
 }
 
 .issue-id {
@@ -259,6 +324,10 @@ body {
   color: var(--muted);
 }
 
+.issue-meta-badge.subissues {
+  color: var(--accent-2);
+}
+
 .issue-labels {
   margin-top: 6px;
   display: flex;
@@ -296,23 +365,121 @@ body {
   padding: 2px 8px;
 }
 
+/* Non-modal slide-in drawer, not a <dialog> — the board stays fully
+   interactive underneath while this is open (no backdrop, no inert). Fixed
+   to the right edge rather than a grid column so it overlays without
+   reflowing the board, and animates in on mount rather than trying to
+   animate out on unmount (which the component's per-issue key/remount
+   pattern makes awkward — see the "Component remounts per issue" note
+   elsewhere in TaskPanel.tsx). */
 .task-panel {
-  grid-column: 2;
-  grid-row: 1 / span 2;
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 20;
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-  align-self: start;
-  position: sticky;
-  top: 16px;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  padding: 20px;
+  width: 50vw;
+  height: 100vh;
+  overflow-y: auto;
+  color: var(--text);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
 }
 
-.task-panel.empty {
+/* No `transition: width` here — confirmed live (including with React
+   bypassed entirely, setting className directly) that animating `width`
+   between these modes leaves the box stuck at whatever value was on screen
+   when the first transition ever kicked in, never settling at the new
+   target. Instant snapping between modes sidesteps the bug entirely and is
+   all "3 quick modes" actually needs. The floor is baked into width itself
+   (max(...)) rather than a separate min-width, which independently also
+   doesn't settle correctly under a transition — moot now, but keep it this
+   way over reintroducing min-width. */
+.task-panel.width-sm {
+  width: max(20vw, 320px);
+}
+
+.task-panel.width-md {
+  width: 50vw;
+}
+
+.task-panel.width-lg {
+  width: 100vw;
+}
+
+.task-panel.open {
+  animation: drawer-in 0.2s ease;
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-panel.open {
+    animation: none;
+  }
+}
+
+.task-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.task-panel-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.task-panel-close {
+  background: none;
+  border: none;
   color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px;
 }
 
-.task-panel h2,
+.task-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.task-panel-width-toggle {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.task-panel-width-toggle button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 7px;
+  border-radius: 4px;
+}
+
+.task-panel-width-toggle button.active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
 .stream h2 {
   margin: 0 0 12px;
   font-size: 15px;
@@ -378,7 +545,7 @@ body {
 .edit-issue-actions button[type="submit"] {
   background: var(--accent);
   border-color: var(--accent);
-  color: white;
+  color: var(--bg);
 }
 
 .edit-issue-actions button:disabled {
@@ -405,12 +572,27 @@ body {
   font-size: 13px;
 }
 
-.task-panel button[type="submit"] {
-  width: 100%;
+.task-fresh-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.task-actions {
+  display: flex;
+  gap: 8px;
   margin-top: 10px;
+}
+
+.task-panel button[type="submit"] {
+  flex: 1;
   background: var(--accent);
   border: none;
-  color: white;
+  color: var(--bg);
   padding: 10px;
   border-radius: 8px;
   cursor: pointer;
@@ -420,6 +602,114 @@ body {
 .task-panel button[type="submit"]:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.task-actions .stop,
+.task-actions .restart {
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.task-actions .stop {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.review-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.review-actions button {
+  flex: 1;
+  border-radius: 8px;
+  padding: 10px;
+  cursor: pointer;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.review-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+
+.parent-issue-link {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.sub-issues {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.sub-issues h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.sub-issue {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.sub-issue-title {
+  flex: 1;
+}
+
+.sub-issue-status {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.comments {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.comments h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.comment {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.comment-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 6px;
 }
 
 .hint {
@@ -433,7 +723,7 @@ body {
   width: 100%;
   background: var(--accent);
   border: none;
-  color: white;
+  color: var(--bg);
   padding: 10px;
   border-radius: 8px;
   cursor: pointer;
@@ -460,25 +750,148 @@ body {
 }
 
 .chat-message {
-  border-radius: 8px;
+  max-width: 100%;
   padding: 8px 10px;
   font-size: 13px;
   line-height: 1.45;
-  white-space: pre-wrap;
   word-break: break-word;
-  border: 1px solid var(--border);
 }
 
 .chat-message.assistant {
-  background: var(--panel-2);
   align-self: flex-start;
 }
 
 .chat-message.user {
-  background: var(--accent);
-  color: white;
-  border-color: var(--accent);
+  color: var(--text);
   align-self: flex-end;
+}
+
+.markdown {
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.markdown p {
+  margin: 0 0 8px;
+}
+
+.markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 10px 0 6px;
+  font-size: 14px;
+  line-height: 1.3;
+}
+
+.markdown h1 {
+  font-size: 16px;
+}
+
+.markdown h2 {
+  font-size: 15px;
+}
+
+.markdown h3 {
+  font-size: 14px;
+}
+
+.markdown ul,
+.markdown ol {
+  margin: 4px 0 8px;
+  padding-left: 20px;
+}
+
+.markdown li {
+  margin: 2px 0;
+}
+
+.markdown li > p {
+  margin: 0;
+}
+
+.markdown a {
+  color: var(--accent-2);
+}
+
+.markdown strong {
+  font-weight: 700;
+}
+
+.markdown blockquote {
+  margin: 6px 0 10px;
+  padding: 2px 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+}
+
+.markdown blockquote p {
+  margin: 4px 0;
+}
+
+.markdown code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.markdown pre {
+  margin: 6px 0 10px;
+  padding: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.markdown pre code {
+  display: block;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.markdown table {
+  border-collapse: collapse;
+  margin: 6px 0 10px;
+  font-size: 12px;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.markdown th {
+  background: var(--panel-2);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.markdown hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+.markdown img {
+  max-width: 100%;
+  border-radius: 6px;
 }
 
 .draft-plan {
@@ -496,21 +909,15 @@ body {
   margin-bottom: 6px;
 }
 
-.draft-plan-text {
-  margin: 0 0 10px;
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text);
+.draft-plan .markdown {
+  margin-bottom: 10px;
 }
 
 .draft-plan button {
   width: 100%;
   background: var(--accent);
   border: none;
-  color: white;
+  color: var(--bg);
   padding: 8px;
   border-radius: 8px;
   cursor: pointer;
@@ -559,7 +966,7 @@ body {
 .chat-input-actions button[type='submit'] {
   background: var(--accent);
   border-color: var(--accent);
-  color: white;
+  color: var(--bg);
 }
 
 .chat-input-actions button:disabled {
@@ -567,22 +974,293 @@ body {
   cursor: not-allowed;
 }
 
-.classification {
-  margin-top: 12px;
+.chat-input-dropzone {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.driver-mode-toggle {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.driver-mode-toggle button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.driver-mode-toggle button.active {
+  background: var(--panel-2);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.driver-mode-pill {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.driver-mode-pill.autonomous {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.driver-watching {
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.driver-owned-badge {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 0 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.driver-running-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  display: inline-block;
+}
+
+.metrics-view {
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.metrics-stats {
+  display: flex;
+  gap: 12px;
+  margin: 12px 0 20px;
+}
+
+.metrics-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.metrics-stat-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.metrics-stat-label {
   font-size: 12px;
   color: var(--muted);
 }
 
-.classification strong {
-  text-transform: capitalize;
+.metrics-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--muted);
 }
 
-.classification-frontend strong {
-  color: var(--accent-2);
+.metrics-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.classification-backend strong {
-  color: var(--green);
+.metrics-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.metrics-chart-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 12px 16px 16px;
+  margin-bottom: 16px;
+}
+
+.metrics-chart-card h3 {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.metrics-chart-scroll {
+  overflow-x: auto;
+}
+
+.metrics-chart-svg {
+  display: block;
+}
+
+.metrics-gridline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.metrics-axis-label {
+  font-size: 11px;
+  fill: var(--muted);
+}
+
+.metrics-bar {
+  fill: var(--accent);
+  transition: filter 0.1s;
+}
+
+.metrics-bar:hover {
+  filter: brightness(1.2);
+}
+
+.metrics-bar-label {
+  font-size: 12px;
+  fill: var(--text);
+}
+
+.metrics-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  fill: none;
+}
+
+.metrics-dot {
+  fill: var(--accent);
+  stroke: var(--panel-2);
+  stroke-width: 2;
+  transition: filter 0.1s;
+}
+
+.metrics-dot:hover {
+  filter: brightness(1.2);
+}
+
+.usage-view {
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.usage-stats {
+  display: flex;
+  gap: 12px;
+  margin: 12px 0 20px;
+}
+
+.usage-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.usage-stat-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.usage-stat-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.usage-stat-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.usage-chart-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 12px 16px 16px;
+  margin-bottom: 16px;
+}
+
+.usage-chart-card h3 {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.usage-chart-scroll {
+  overflow-x: auto;
+}
+
+.usage-chart-svg {
+  display: block;
+}
+
+.usage-gridline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.usage-axis-label {
+  font-size: 11px;
+  fill: var(--muted);
+}
+
+.usage-line {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 0;
+}
+
+.chat-attachment-thumb {
+  position: relative;
+  display: inline-block;
+  width: 64px;
+  height: 64px;
+  margin-right: 6px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.chat-attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.chat-attachment-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  cursor: pointer;
 }
 
 .pr-link {
@@ -641,11 +1319,6 @@ body {
   font-size: 12px;
 }
 
-.stream-classification {
-  text-transform: capitalize;
-  color: var(--muted);
-}
-
 .stream-status {
   margin-left: auto;
   color: var(--amber);
@@ -659,6 +1332,10 @@ body {
   color: var(--red);
 }
 
+.stream-status.stopped {
+  color: var(--muted);
+}
+
 .stream-body {
   display: flex;
   flex-direction: column;
@@ -667,26 +1344,37 @@ body {
   overflow-y: auto;
 }
 
-.agent-text {
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text);
-}
-
 .tool-call-card {
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 8px 10px;
+  padding: 9px 12px;
+  margin-bottom: 10px;
   background: var(--panel-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .tool-call-header {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tool-call-header::-webkit-details-marker {
+  display: none;
+}
+
+.tool-call-header::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 10px;
+  flex: none;
+}
+
+.tool-call-card[open] > .tool-call-header::before {
+  content: "▾";
 }
 
 .tool-call-status-dot {
@@ -738,6 +1426,58 @@ body {
   overflow-y: auto;
 }
 
+.loading-dots {
+  --dot-size: 7px;
+  --line-height: 18px;
+  --dot-color: var(--muted);
+  --duration: 1.6s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--line-height);
+  padding: 4px 2px;
+}
+
+.loading-dots .dot {
+  width: var(--dot-size);
+  height: var(--dot-size);
+  border-radius: 50%;
+  background: var(--dot-color);
+  opacity: 0;
+}
+
+.loading-dots .dot:nth-child(1) { animation: loading-dot1 var(--duration) ease-in-out infinite; }
+.loading-dots .dot:nth-child(2) { animation: loading-dot2 var(--duration) ease-in-out infinite; }
+.loading-dots .dot:nth-child(3) { animation: loading-dot3 var(--duration) ease-in-out infinite; }
+
+@keyframes loading-dot1 {
+  0%              { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+  16.6667%        { opacity: 1; transform: translateY(0); }
+  50%             { opacity: 1; transform: translateY(0); }
+  58.3333%        { opacity: 1; transform: translateY(calc(var(--line-height) / -2)); }
+  66.6667%, 100%  { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+}
+
+@keyframes loading-dot2 {
+  0%, 16.6667%    { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+  33.3333%        { opacity: 1; transform: translateY(0); }
+  66.6667%        { opacity: 1; transform: translateY(0); }
+  75%             { opacity: 1; transform: translateY(calc(var(--line-height) / -2)); }
+  83.3333%, 100%  { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+}
+
+@keyframes loading-dot3 {
+  0%, 33.3333%    { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+  50%             { opacity: 1; transform: translateY(0); }
+  83.3333%        { opacity: 1; transform: translateY(0); }
+  91.6667%        { opacity: 1; transform: translateY(calc(var(--line-height) / -2)); }
+  100%            { opacity: 0; transform: translateY(calc(var(--line-height) / -2)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-dots .dot { animation: none; opacity: 1; transform: none; }
+}
+
 .status-line {
   font-size: 12px;
   color: var(--muted);
@@ -748,8 +1488,26 @@ body {
   color: var(--accent-2);
 }
 
-.status-needs-action {
+.status-blocked-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 6px 12px;
+  background: #e2a13b14;
+  border: 1px solid #e2a13b40;
+  border-radius: 20px;
+  font-size: 12.5px;
   color: var(--amber);
+  font-weight: 500;
+}
+
+.status-blocked-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  display: inline-block;
 }
 
 .orchestrator-note {
@@ -830,14 +1588,15 @@ body {
 }
 
 @media (max-width: 860px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
-
-  .task-panel {
-    grid-column: 1;
-    grid-row: auto;
-    position: static;
+  /* Width modes are impractical on small screens — force full width
+     regardless of mode, and beat .width-sm/md/lg's equal specificity by
+     listing them explicitly (source order alone wouldn't win the tie). */
+  .task-panel,
+  .task-panel.width-sm,
+  .task-panel.width-md,
+  .task-panel.width-lg {
+    width: 100vw;
+    padding: 14px;
   }
 
   .columns {
@@ -847,4 +1606,555 @@ body {
   .column {
     min-width: 45%;
   }
+}
+
+/* --- Ideation view --- */
+
+/* Shared by Ideation, Driver, and Design — all three are full-page, non-drawer
+   chat views (unlike RefineChat's narrower panel), so all three get the same
+   toolbar+strip+composer-bar treatment via these comma-joined selectors. */
+.ideation-view,
+.driver-view,
+.design-view {
+  display: flex;
+  flex-direction: column;
+}
+
+.ideation-toolbar,
+.driver-toolbar,
+.design-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 0 10px;
+}
+
+.ideation-project-picker,
+.driver-project-picker,
+.design-project-picker,
+.design-issue-picker {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--panel-2) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><path d="M0 0l5 6 5-6z" fill="%238b8f99"/></svg>') no-repeat right 12px center;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 30px 7px 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ideation-new-btn,
+.driver-new-btn,
+.design-new-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.ideation-new-btn:hover:not(:disabled),
+.driver-new-btn:hover:not(:disabled),
+.design-new-btn:hover:not(:disabled) {
+  background: #22c55e1a;
+}
+
+.ideation-new-btn:disabled,
+.driver-new-btn:disabled,
+.design-new-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.synthesis-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  background: var(--panel-2);
+}
+
+.synthesis-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.synthesis-panel-header::-webkit-details-marker {
+  display: none;
+}
+
+.synthesis-panel-header::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 10px;
+  flex: none;
+}
+
+.synthesis-panel[open] > .synthesis-panel-header::before {
+  content: "▾";
+}
+
+.synthesis-panel-title {
+  font-weight: 500;
+}
+
+.synthesis-panel-updated {
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.synthesis-panel-body {
+  margin-top: 10px;
+}
+
+.synthesis-panel-body button {
+  margin-top: 8px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.synthesis-panel-body button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ideation-strip,
+.driver-strip,
+.design-strip {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0 14px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Wraps a strip item + its delete button — the delete button can't nest
+   inside the item's own <button>, so it's an absolutely-positioned sibling
+   instead, only visible on hover to keep the strip visually quiet. */
+.strip-item-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.strip-item-delete {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.strip-item-wrap:hover .strip-item-delete {
+  opacity: 1;
+}
+
+.strip-item-delete:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.ideation-strip-item,
+.driver-strip-item,
+.design-strip-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  text-align: left;
+  color: var(--text);
+  font: inherit;
+}
+
+.ideation-strip-item.selected,
+.driver-strip-item.selected,
+.design-strip-item.selected {
+  background: var(--panel-2);
+  border-color: var(--accent);
+}
+
+.ideation-strip-title-row,
+.driver-strip-title-row,
+.driver-strip-meta-row,
+.design-strip-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ideation-strip-title,
+.driver-strip-title,
+.design-strip-title {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ideation-strip-blocked-dot,
+.driver-strip-blocked-dot,
+.design-strip-blocked-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.ideation-strip-time,
+.driver-strip-time,
+.design-strip-time {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.design-issue-badge {
+  font-size: 11px;
+  color: var(--accent-2);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  padding: 0 5px;
+}
+
+/* ponytail: true flex-fill isn't available without touching the shared,
+   unsized .app/.layout shell (out of scope here) — this calc assumes the
+   current fixed chrome above/below it (~64px header, ~54px toolbar, ~60px
+   strip, ~80px composer, 16px page padding). Retune if those heights
+   change enough to matter. */
+.ideation-chat .chat-messages,
+.driver-chat .chat-messages {
+  max-height: calc(100vh - 320px);
+  min-height: 200px;
+}
+
+/* Bleeds to the page edges like the topbar (same -16px trick, canceling
+   .app's own padding), so the composer reads as a distinct bar instead of
+   the textarea/button floating on the bare page background. */
+.ideation-chat .chat-input,
+.driver-chat .chat-input,
+.design-chat .chat-input {
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  padding: 14px 16px;
+  margin: 0 -16px -16px;
+}
+
+/* The composer's real flex container is .chat-input-dropzone (attachments
+   are always enabled for Ideation/EM) — .chat-input itself only wraps that
+   one child, so the row layout has to apply one level deeper. */
+.ideation-chat .chat-input-dropzone,
+.driver-chat .chat-input-dropzone,
+.design-chat .chat-input-dropzone {
+  flex-direction: row;
+  align-items: flex-end;
+}
+
+.ideation-chat .chat-input textarea,
+.driver-chat .chat-input textarea,
+.design-chat .chat-input textarea {
+  width: auto;
+  flex: 1;
+}
+
+.ideation-chat .chat-input-actions,
+.driver-chat .chat-input-actions,
+.design-chat .chat-input-actions {
+  flex: none;
+  display: flex;
+  gap: 8px;
+}
+
+.ideation-chat .chat-input-actions button,
+.driver-chat .chat-input-actions button,
+.design-chat .chat-input-actions button {
+  flex: none;
+}
+
+/* --- Design view --- */
+
+/* Unlike Ideation/Driver (single chat column, sized by capping .chat-messages
+   to a vh-relative height — see the shared rule above), Design is a
+   side-by-side split where the preview needs to match the chat's real height,
+   not just avoid overflowing. That needs an actual flex chain with a real
+   height at the top, not two independently-capped columns — .design-main is
+   the anchor (same vh-offset trick, scoped to Design's own toolbar+strip
+   chrome), everything below it stretches via flex/grid instead of guessing
+   its own height off the viewport. */
+.design-main {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 230px);
+  min-height: 0;
+}
+
+/* min-width: 0 matters as much as min-height: 0 here — grid items default to
+   min-width: auto, so an unbreakable run of text (raw HTML pasted into a
+   message, a long URL) can force this column past its 1fr share, squeezing
+   the preview column next to it. Without this, that's a real, reproduced
+   failure mode, not a theoretical one. */
+.design-chat {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.design-chat .chat-thread {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.design-chat .chat-messages {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.design-link-row {
+  padding: 10px 0;
+}
+
+.design-link-row select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--panel-2) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><path d="M0 0l5 6 5-6z" fill="%238b8f99"/></svg>') no-repeat right 12px center;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 30px 7px 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.design-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.design-commit-btn {
+  padding: 8px 14px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.design-commit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.design-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.design-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.design-preview-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.design-preview-toolbar button {
+  margin-left: auto;
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.design-preview-frame {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.design-preview-split {
+  flex: 1;
+  display: flex;
+  gap: 8px;
+  min-height: 0;
+}
+
+.design-preview-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.design-preview-pane .design-preview-frame {
+  flex: 1;
+}
+
+.design-controls-pane {
+  width: 320px;
+  min-width: 280px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.design-controls-frame {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.design-tokens-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.design-token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.design-token-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.design-token-name {
+  color: var(--muted);
+}
+
+.design-token-value {
+  color: var(--text);
+}
+
+.ideation-candidates {
+  margin-top: 4px;
+}
+
+.ideation-candidates-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.ideation-candidate {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 10px;
+  background: var(--panel-2);
+}
+
+.ideation-candidate-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ideation-candidate-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ideation-candidate input,
+.ideation-candidate select,
+.ideation-candidate textarea {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: var(--text);
+  font: inherit;
+}
+
+.ideation-candidate textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.ideation-candidate button {
+  align-self: flex-start;
+  background: var(--accent);
+  border: none;
+  color: var(--bg);
+  padding: 9px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.ideation-candidate button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

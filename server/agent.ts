@@ -184,6 +184,15 @@ export function buildDesignPrompt({
 
 ${issueBlock}${synthesisBlock}Write your mockup to ${designDir}/index.html — a single file, inline CSS in a <style> block and inline JS in a <script> block if you need interactivity. No external requests (fonts, CDNs, images by URL): the preview renders this file in a sandboxed iframe with no network access, so anything external will just fail to load. Use data: URIs or inline SVG for any imagery.
 
+Also write ${designDir}/controls.html — a second file that contains any interactive controls for the mockup. This file is rendered in a separate sandboxed iframe next to the preview. The two iframes cannot access each other's DOM directly; they communicate by posting messages to the parent window. The parent relays messages between them.
+
+POST-MESSAGE PROTOCOL
+- The preview iframe listens for \`message\` events and expects objects shaped like \`{ type: 'design-command', command: string, value?: any }\`.
+- The controls iframe sends commands by calling \`parent.postMessage({ type: 'design-command', command: 'set-theme', value: 'dark' }, '*')\`.
+- Use commands like \`set-theme\`, \`set-variant\`, \`toggle-state\`, \`update-data\` — anything the preview can act on.
+- The preview iframe should add a \`window.addEventListener('message', ...)\` handler at the top of its <script> block that applies incoming commands to the mockup's state or class names.
+- Both files must be standalone HTML documents with their own <html>/<head>/<body> structure. The preview file's <body> is the mockup; the controls file's <body> contains buttons, selects, or other inputs that dispatch commands via \`parent.postMessage\`.
+
 DESIGN TOKENS
 Declare your palette, spacing scale, and type scale as CSS custom properties in a :root { } block at the top of the <style> section — e.g. --color-bg, --color-accent, --space-sm, --font-heading. Use them throughout the rest of the stylesheet rather than repeating literal values. This makes the mockup's design system inspectable at a glance.
 
@@ -191,7 +200,7 @@ SKILLS
 If this project defines design skills under .claude/skills/, load the relevant one before designing and follow it — it carries this project's design system (colors, components, tone). Check for it before starting.
 
 ITERATION
-Rewrite index.html in place each turn rather than accumulating variants — the preview always reflects the current file's latest state, so there is only ever one live version of this screen.
+Rewrite index.html and controls.html in place each turn rather than accumulating variants — the preview always reflects the current files' latest state, so there is only ever one live version of this screen.
 
 BOUNDARY
 Read the rest of the repository freely (existing components, styles, tokens) to match the real product's look — but you may only write inside ${designDir}. Never touch app source, git, or Linear directly; you have no access to any of them from here.`
