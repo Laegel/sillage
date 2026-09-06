@@ -43,6 +43,10 @@ function agentEventToPart(event: AgentEvent): ContentPart {
       return { type: 'data', name: 'separator', data: event }
     case 'orchestrator':
       return { type: 'data', name: 'orchestrator', data: event }
+    case 'ideation_candidates':
+      return { type: 'data', name: 'ideation_candidates', data: event }
+    case 'usage':
+      return { type: 'data', name: 'usage', data: event }
   }
 }
 

@@ -1,5 +1,5 @@
 import React from 'react'
-import { createIssue, fetchIssue, fetchIssues, fetchProjects, setIssueStatus, updateIssue, fetchPlans } from './api.ts'
+import { createIssue, fetchIssue, fetchIssues, fetchProjects, setIssueStatus, updateIssue } from './api.ts'
 import { useSocket } from './useSocket.ts'
 import IssueTracker from './components/IssueTracker.tsx'
 import TaskPanel from './components/TaskPanel.tsx'
@@ -9,9 +9,8 @@ import DriverView from './components/DriverView.tsx'
 import DesignView from './components/DesignView.tsx'
 import MetricsView from './components/MetricsView.tsx'
 import UsageView from './components/UsageView.tsx'
-import PlansView from './components/PlansView.tsx'
 import Toasts from './components/Toasts.tsx'
-import type { ChatMessage, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, StreamEntry, ToastMessage, WsMessage, Plan } from './types.ts'
+import type { ChatMessage, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, StreamEntry, ToastMessage, WsMessage } from './types.ts'
 import { appendEvent, eventsToPlainText } from './lib/agentEvents.ts'
 import { loadRefineHistory, saveRefineHistory, toRefineHistoryStore } from './lib/refineHistory.ts'
 import { loadIdeationSessions, saveIdeationSessions } from './lib/ideationHistory.ts'
@@ -92,37 +91,7 @@ export default function App() {
   // preview has no other signal that the mockup file on disk just changed.
   const [designPreviewRefresh, setDesignPreviewRefresh] = React.useState<Record<string, number>>({})
   const [selectedDesignId, setSelectedDesignId] = React.useState<string | null>(null)
-  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'usage' | 'plans'>('project')
-  const [plans, setPlans] = React.useState<Plan[]>([])
-  const [plansLoading, setPlansLoading] = React.useState(false)
-  const [plansError, setPlansError] = React.useState('')
-
-  React.useEffect(() => {
-    if (!selectedId) {
-      setPlans([])
-      return
-    }
-    setPlansLoading(true)
-    setPlansError('')
-    fetchPlans(selectedId)
-      .then((data) => setPlans(data.plans))
-      .catch((err) => setPlansError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setPlansLoading(false))
-  }, [selectedId])
-
-  const refreshPlans = React.useCallback(async () => {
-    if (!selectedId) return
-    setPlansLoading(true)
-    setPlansError('')
-    try {
-      const data = await fetchPlans(selectedId)
-      setPlans(data.plans)
-    } catch (err) {
-      setPlansError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setPlansLoading(false)
-    }
-  }, [selectedId])
+  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'usage'>('project')
 
   React.useEffect(() => {
     saveRefineHistory(toRefineHistoryStore(refineChats, draftPlans))
@@ -140,15 +109,27 @@ export default function App() {
     saveDesignSessions(designSessions)
   }, [designSessions])
 
-  const refresh = React.useCallback(async () => {
+  // The real Linear API is flaky enough that a single failed fetch (common
+  // on a cold cache) would otherwise strand the board on a permanent error
+  // until the user manually reloads — retry a couple of times before giving
+  // up and showing loadError (which still has its own manual Retry button).
+  const refresh = React.useCallback(async (attempt = 0) => {
+    if (attempt === 0) {
+      setIssuesLoading(true)
+      setIssuesError('')
+    }
     try {
       const data = await fetchIssues()
       setIssues(data.issues)
       setColumns(data.columns)
       setIssuesError('')
+      setIssuesLoading(false)
     } catch (err) {
+      if (attempt < 2) {
+        setTimeout(() => refresh(attempt + 1), 2000)
+        return
+      }
       setIssuesError(err instanceof Error ? err.message : String(err))
-    } finally {
       setIssuesLoading(false)
     }
   }, [])
@@ -997,9 +978,6 @@ export default function App() {
           <button type="button" className={view === 'usage' ? 'active' : ''} onClick={() => setView('usage')}>
             Usage
           </button>
-          <button type="button" className={view === 'plans' ? 'active' : ''} onClick={() => setView('plans')}>
-            Plans
-          </button>
         </nav>
         <div className={`status-dot ${connected ? 'online' : 'offline'}`} title={connected ? 'orchestrator online' : 'orchestrator offline'}>
           {connected ? 'orchestrator online' : 'orchestrator offline'}
@@ -1018,6 +996,7 @@ export default function App() {
             onSelect={(issue) => setSelectedId(issue.id)}
             onCreate={handleCreate}
             onMove={handleMove}
+            onRetry={refresh}
           />
         )}
         {view === 'execution' && (
@@ -1075,33 +1054,28 @@ export default function App() {
         )}
         {view === 'metrics' && <MetricsView issues={issues} projects={projects} columns={columns} />}
         {view === 'usage' && <UsageView />}
-        {view === 'plans' && (
-          <div className="plans-panel">
-            <h2>Plans{selectedId ? ` for ${selectedId}` : ''}</h2>
-            {plansError && <p className="error">{plansError}</p>}
-            <PlansView plans={plans} disabled={plansLoading} onApply={refreshPlans} />
-          </div>
-        )}
       </main>
-      <TaskPanel
-        key={selected?.id}
-        issue={selected ? { ...selected, prUrl: selectedPrUrl } : null}
-        connected={connected}
-        running={running}
-        onStart={handleStart}
-        onStop={handleStop}
-        onRestart={handleRestart}
-        onUpdate={handleUpdate}
-        onMove={handleMove}
-        onClose={() => setSelectedId(null)}
-        refineChat={selectedId ? refineChats[selectedId] || [] : []}
-        refineRunning={selectedId ? refineRunning.has(selectedId) : false}
-        draftPlan={selectedId ? draftPlans[selectedId] || null : null}
-        onRefineStart={handleRefineStart}
-        onRefineMessage={handleRefineMessage}
-        onConsolidate={handleConsolidate}
-        onApplyPlan={handleApplyPlan}
-      />
+      {selected && (
+        <TaskPanel
+          key={selected.id}
+          issue={{ ...selected, prUrl: selectedPrUrl }}
+          connected={connected}
+          running={running}
+          onStart={handleStart}
+          onStop={handleStop}
+          onRestart={handleRestart}
+          onUpdate={handleUpdate}
+          onMove={handleMove}
+          onClose={() => setSelectedId(null)}
+          refineChat={selectedId ? refineChats[selectedId] || [] : []}
+          refineRunning={selectedId ? refineRunning.has(selectedId) : false}
+          draftPlan={selectedId ? draftPlans[selectedId] || null : null}
+          onRefineStart={handleRefineStart}
+          onRefineMessage={handleRefineMessage}
+          onConsolidate={handleConsolidate}
+          onApplyPlan={handleApplyPlan}
+        />
+      )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
     </div>
   )

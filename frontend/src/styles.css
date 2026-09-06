@@ -772,6 +772,35 @@ body {
   word-break: break-word;
 }
 
+.chat-message-image {
+  display: block;
+  max-width: 160px;
+  max-height: 160px;
+  width: auto;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin: 4px 0;
+  cursor: zoom-in;
+}
+
+.image-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  cursor: zoom-out;
+}
+
+.image-modal-content {
+  max-width: 90vw;
+  max-height: 90vh;
+  border-radius: 8px;
+}
+
 .markdown p {
   margin: 0 0 8px;
 }
@@ -1928,6 +1957,7 @@ body {
 .design-chat {
   display: flex;
   flex-direction: column;
+  height: 100%;
   min-width: 0;
   min-height: 0;
 }
@@ -1965,12 +1995,33 @@ body {
   cursor: pointer;
 }
 
-.design-split {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
+/* Host for the dockview instance that replaced the old fixed .design-split
+   grid — dockview needs a real, definite height to fill (its root wrapper
+   is height:100%), same flex-fills-remaining-space anchor .design-main
+   already provides for everything else in this view. */
+.design-dock {
   flex: 1;
   min-height: 0;
+}
+
+/* Overrides dockview's built-in abyss theme colors to match this app's own
+   palette instead of shipping its own hardcoded dark theme alongside it.
+   Scoped under .design-dock for specificity, not stylesheet order, since
+   this file and dockview's own CSS are imported from different places. */
+.design-dock .dockview-theme-abyss {
+  --dv-group-view-background-color: var(--bg);
+  --dv-tabs-and-actions-container-background-color: var(--panel-2);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--panel);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--panel-2);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--panel-2);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--panel-2);
+  --dv-tab-divider-color: var(--border);
+  --dv-activegroup-visiblepanel-tab-color: var(--text);
+  --dv-activegroup-hiddenpanel-tab-color: var(--muted);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--muted);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--muted);
+  --dv-separator-border: var(--border);
+  --dv-paneview-header-border-color: var(--border);
 }
 
 .design-commit-btn {
@@ -1993,21 +2044,17 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  height: 100%;
   min-width: 0;
   min-height: 0;
+  padding: 8px;
+  box-sizing: border-box;
 }
 
 .design-preview-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.design-preview-label {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--muted);
 }
 
 .design-preview-toolbar button {
@@ -2030,30 +2077,13 @@ body {
   background: #fff;
 }
 
-.design-preview-split {
-  flex: 1;
-  display: flex;
-  gap: 8px;
-  min-height: 0;
-}
-
-.design-preview-pane {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-}
-
-.design-preview-pane .design-preview-frame {
-  flex: 1;
-}
-
 .design-controls-pane {
-  width: 320px;
-  min-width: 280px;
+  height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  padding: 8px;
+  box-sizing: border-box;
 }
 
 .design-controls-frame {
@@ -2069,6 +2099,10 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  height: 100%;
+  overflow-y: auto;
+  padding: 9px 12px;
+  box-sizing: border-box;
 }
 
 .design-token-row {

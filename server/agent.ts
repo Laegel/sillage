@@ -1,14 +1,96 @@
-import { type ChildProcessByStdio, spawn } from 'node:child_process'
-import type { Readable } from 'node:stream'
-import readline from 'node:readline'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { readFile } from 'node:fs/promises'
+import { closeSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import type { AgentEvent, Comment, Issue, DriverMode } from './types.ts'
 import type { SynthesisEntry } from './synthesis-store.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const SILLAGE_ROOT = join(__dirname, '..')
+const RUN_LOGS_DIR = join(SILLAGE_ROOT, 'run-logs')
+
+// Agent stdout used to be read directly off an in-process pipe (proc.stdout) —
+// fine for a live run, but the pipe's read end dies the instant this server
+// process exits/restarts, permanently orphaning whatever the child was still
+// writing (see server/run-registry.ts for the other half of this: persisting
+// {pid, logFile} so a fresh server instance can find it again). Redirecting
+// stdout straight to a real file instead removes that failure mode — a file
+// has no "broken pipe", so the child keeps writing regardless of who, if
+// anyone, is reading — and gives a NEW server process something to reopen
+// and keep tailing from wherever the old one left off.
+function openRunLog(kind: string, id: string): string {
+  mkdirSync(RUN_LOGS_DIR, { recursive: true })
+  const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '_')
+  return join(RUN_LOGS_DIR, `${kind}-${safeId}-${Date.now()}.ndjson`)
+}
+
+// Polls an ndjson log file for newly-appended, complete lines — the read-side
+// counterpart of openRunLog's file-backed stdout. Used for every run, live or
+// recovered, so the two cases share one parsing path (see runClaude/
+// attachOpencodeFamilyStream below). Plain fs reads, no new dependency — these
+// are lightweight text logs, not large enough to need anything fancier than
+// "read what's new since last tick".
+function tailLines(logFile: string, onLine: (line: string) => void, pollMs = 300): () => void {
+  let offset = 0
+  let buffer = ''
+  let stopped = false
+
+  const tick = () => {
+    if (stopped) return
+    let size: number
+    try {
+      size = statSync(logFile).size
+    } catch {
+      return // not created yet
+    }
+    if (size <= offset) return
+    const fd = openSync(logFile, 'r')
+    try {
+      const len = size - offset
+      const chunk = Buffer.alloc(len)
+      readSync(fd, chunk, 0, len, offset)
+      offset = size
+      buffer += chunk.toString('utf8')
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) onLine(line)
+    } finally {
+      closeSync(fd)
+    }
+  }
+
+  tick()
+  const timer = setInterval(tick, pollMs)
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The only way to detect completion of a recovered run — we don't hold its
+// ChildProcess (that died with the old server process), only the pid read
+// back from server/run-registry.ts, so there's no 'exit' event to listen for.
+function watchPidExit(pid: number, pollMs = 500): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (!isPidAlive(pid)) {
+        clearInterval(timer)
+        resolve()
+      }
+    }, pollMs)
+  })
+}
 
 function renderComments(comments: Comment[]): string {
   if (comments.length === 0) return '(none)'
@@ -42,15 +124,16 @@ ${task}
 
 RULES (also enforced by CLAUDE.md)
 1. Before doing anything else, check for existing work on this issue: run \`git branch --list 'feat/${issue.id}-*'\` and \`git status\`, and review the existing comments above — a prior attempt may have left a blocker note or partial-progress explanation there. If a matching branch already exists, check it out (if not already on it) and CONTINUE from there instead of starting over — assess what's already done (git status, git diff, git log) and what still remains, then pick up where it left off. Only create a new branch named feat/${issue.id}-<kebab-slug> (for example feat/${issue.id}-add-toggle) if none already exists.
-2. If the description above has a "## Relevant symbols" section, it was left by an earlier refinement discussion as a fast-path hint, not gospel — for each cited symbol, look it up (e.g. \`codegraph query <name>\`, or grep as a fallback) to confirm it still exists and still matches what's described, and start your exploration there instead of a broad search. The codebase may have moved on since it was written, so re-verify rather than trust; fall back to normal from-scratch exploration for anything missing, changed, or if the section isn't present at all.
-3. Commit messages must be prefixed with the Linear issue id: "${issue.id}: <summary>".
-4. The PR description MUST reference the Linear issue id ${issue.id}.
-5. Do NOT send any manual notification about the PR. A PostToolUse hook detects "gh pr create" and notifies the orchestrator.
-6. Before opening a PR, check whether one already exists for this branch (e.g. \`gh pr list --head <branch>\`). If one exists, just push your commits to update it — do not open a duplicate. Otherwise open it with: gh pr create --title "<title>" --body "Closes ${issue.id} — <summary>"
-7. Use the GitHub MCP for commit, push and PR creation. Use the Linear MCP to re-read the issue and, once the PR is open, set its status to "In Review" and attach the PR link as a comment.
-8. If you get blocked — missing information, an ambiguous requirement, a decision only a human should make, or something you genuinely can't resolve yourself — stop rather than guessing or shipping something you're not confident in. Commit whatever real progress you've made first (so a resumed run doesn't lose it, per rule 1), then use the Linear MCP to: (a) add a comment on the issue stating exactly what's blocking you and what you need to proceed, @mentioning the workspace owner in that comment so they're actually notified (use the Linear MCP's own current-user/viewer lookup, or the issue's creator, to find who to mention — don't guess a name), (b) add the "Blocked" label to the issue, and (c) set the issue status back to "Todo". Do not open a PR for blocked or incomplete work.
-9. When you narrate progress outside of tool calls, keep it to short, single-line notes at natural checkpoints (e.g. after finishing a step) rather than long paragraphs — this is read as a live log, not a report.
-10. Do NOT write your own plan, notes, or design-doc files (e.g. PLAN.md, NOTES.md, .kilo/plans/*.md). The Linear issue is the single source of truth: if you need to record a plan of approach or a decision so it survives across turns, add it as a comment on the issue via the Linear MCP instead of a local file. This is enforced, not just requested: any such write will be denied regardless of tool (write, bash heredoc, echo redirect, sed -i, etc.) — if one is denied, that is intentional and permanent, do not retry it a different way.`
+2. Check for a linked design mockup at design/${issue.id}/index.html (and controls.html) in this repo. If present, treat it as the UI spec: match its structure and styling rather than reinterpreting it loosely. If an element in it carries a data-component="..." attribute or a <!-- component: ... --> comment, verify that path still exists and still looks like a real match before trusting it (things may have moved since the mockup was made, same caveat as rule 3's "Relevant symbols" hint below) — if it checks out, reuse that exact existing component instead of re-implementing equivalent markup or styles; if it's gone or no longer fits, fall back to matching the mockup's appearance directly.
+3. If the description above has a "## Relevant symbols" section, it was left by an earlier refinement discussion as a fast-path hint, not gospel — for each cited symbol, look it up (e.g. \`codegraph query <name>\`, or grep as a fallback) to confirm it still exists and still matches what's described, and start your exploration there instead of a broad search. The codebase may have moved on since it was written, so re-verify rather than trust; fall back to normal from-scratch exploration for anything missing, changed, or if the section isn't present at all.
+4. Commit messages must be prefixed with the Linear issue id: "${issue.id}: <summary>".
+5. The PR description MUST reference the Linear issue id ${issue.id}.
+6. Do NOT send any manual notification about the PR. A PostToolUse hook detects "gh pr create" and notifies the orchestrator.
+7. Before opening a PR, check whether one already exists for this branch (e.g. \`gh pr list --head <branch>\`). If one exists, just push your commits to update it — do not open a duplicate. Otherwise open it with: gh pr create --title "<title>" --body "Closes ${issue.id} — <summary>"
+8. Use the GitHub MCP for commit, push and PR creation. Use the Linear MCP to re-read the issue and, once the PR is open, set its status to "In Review" and attach the PR link as a comment.
+9. If you get blocked — missing information, an ambiguous requirement, a decision only a human should make, or something you genuinely can't resolve yourself — stop rather than guessing or shipping something you're not confident in. Commit whatever real progress you've made first (so a resumed run doesn't lose it, per rule 1), then use the Linear MCP to: (a) add a comment on the issue stating exactly what's blocking you and what you need to proceed, @mentioning the workspace owner in that comment so they're actually notified (use the Linear MCP's own current-user/viewer lookup, or the issue's creator, to find who to mention — don't guess a name), (b) add the "Blocked" label to the issue, and (c) set the issue status back to "Todo". Do not open a PR for blocked or incomplete work.
+10. When you narrate progress outside of tool calls, keep it to short, single-line notes at natural checkpoints (e.g. after finishing a step) rather than long paragraphs — this is read as a live log, not a report.
+11. Do NOT write your own plan, notes, or design-doc files (e.g. PLAN.md, NOTES.md, .kilo/plans/*.md). The Linear issue is the single source of truth: if you need to record a plan of approach or a decision so it survives across turns, add it as a comment on the issue via the Linear MCP instead of a local file. This is enforced, not just requested: any such write will be denied regardless of tool (write, bash heredoc, echo redirect, sed -i, etc.) — if one is denied, that is intentional and permanent, do not retry it a different way.`
 }
 
 // First-turn framing for a "Refine" chat: unlike buildPrompt(), this never writes
@@ -199,6 +282,9 @@ Declare your palette, spacing scale, and type scale as CSS custom properties in 
 SKILLS
 If this project defines design skills under .claude/skills/, load the relevant one before designing and follow it — it carries this project's design system (colors, components, tone). Check for it before starting.
 
+DESIGN SYSTEM
+Before you start designing, look for whatever passes for this project's existing design system — a components directory, a shared UI/ui-kit package, a storybook config, existing design tokens — and treat what you find as your starting palette and component set rather than inventing your own from scratch. If an element in your mockup corresponds to something that already exists there, don't just visually approximate it: mark it with a data-component="path/to/Component" attribute (or, for a non-file-addressable match, an HTML comment directly above it, e.g. <!-- component: src/components/Button.tsx -->) pointing at the real thing. This is the link the implementer uses later to reuse the actual component instead of rebuilding a lookalike — leave it whenever you recognize a match, even if you're not fully sure.
+
 ITERATION
 Rewrite index.html and controls.html in place each turn rather than accumulating variants — the preview always reflects the current files' latest state, so there is only ever one live version of this screen.
 
@@ -297,10 +383,11 @@ function buildSettingsJson(): string {
 export function spawnClaude(
   prompt: string,
   projectDir: string,
+  logFile: string,
   session?: { id: string; resume: boolean },
   readOnly?: boolean,
   designDir?: string,
-): ChildProcessByStdio<null, Readable, Readable> {
+): ChildProcess {
   const bin = process.env.CLAUDE_BIN || 'claude'
   const args = [
     '-p',
@@ -332,16 +419,21 @@ export function spawnClaude(
   if (readOnly) args.push('--disallowedTools', 'Edit,Write,NotebookEdit,Task')
   else if (designDir) args.push('--disallowedTools', 'Task')
   if (session) args.push(session.resume ? '--resume' : '--session-id', session.id)
-  return spawn(bin, args, {
-    cwd: projectDir,
-    env: {
-      ...process.env,
-      ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
-      SILLAGE_READ_ONLY: readOnly ? 'true' : 'false',
-      ...(designDir ? { SILLAGE_DESIGN_DIR: designDir } : {}),
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const outFd = openSync(logFile, 'a')
+  try {
+    return spawn(bin, args, {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
+        SILLAGE_READ_ONLY: readOnly ? 'true' : 'false',
+        ...(designDir ? { SILLAGE_DESIGN_DIR: designDir } : {}),
+      },
+      stdio: ['ignore', outFd, 'pipe'],
+    })
+  } finally {
+    closeSync(outFd)
+  }
 }
 
 function isAuthError(result: string): boolean {
@@ -392,20 +484,26 @@ export function runClaude({
   onProcess,
   readOnly,
   designDir,
+  resume,
 }: {
   prompt: string
   projectDir: string
   onOutput: (event: AgentEvent) => void
   session?: { id: string; resume: boolean }
-  // Lets the caller (index.ts) capture a killable handle for stop/restart —
-  // fired once, right after spawn, with no effect on the run itself.
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  // Lets the caller (index.ts) capture a killable handle plus the log file
+  // path (for server/run-registry.ts to persist) — fired once, right after
+  // spawn, with no effect on the run itself. Never fires on a resumed run —
+  // there's no fresh process to hand back, the registry entry already exists.
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
   readOnly?: boolean
   designDir?: string
+  // Reattach to a process from a previous server instance instead of
+  // spawning a new one — see server/run-registry.ts. session.id is still
+  // required (it names the Claude session being resumed), but no CLI process
+  // is started; output comes from tailing the existing logFile instead.
+  resume?: { pid: number; logFile: string }
 }): Promise<{ exitCode: number | null; needsFallback: boolean; sessionId?: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawnClaude(prompt, projectDir, session, readOnly, designDir)
-    onProcess?.(proc)
     let result = ''
     let sawResult = false
     let fallback = false
@@ -414,25 +512,9 @@ export function runClaude({
     // assistant messages announce a tool_use; the matching tool_result (the actual
     // output) only arrives later in a "user" message — held here until paired up.
     const pendingTools = new Map<string, { name: string; input: unknown }>()
+    let killProc = () => {}
 
-    proc.on('error', (err) => reject(err))
-
-    proc.on('exit', (code) => {
-      if (!settled) {
-        settled = true
-        if (!sawResult) {
-          fallback = true
-          if (stderrText) onOutput({ kind: 'orchestrator', text: `claude stderr: ${stderrText}` })
-        }
-        resolve({ exitCode: code, needsFallback: fallback, sessionId: session?.id })
-      }
-    })
-
-    proc.stderr.on('data', (chunk) => {
-      stderrText += chunk.toString()
-    })
-
-    readline.createInterface({ input: proc.stdout }).on('line', (line) => {
+    const handleLine = (line: string) => {
       try {
         const msg = JSON.parse(line)
         if (msg.type === 'assistant') {
@@ -492,12 +574,50 @@ export function runClaude({
           }
           if (msg.is_error && isAuthError(result)) {
             fallback = true
-            proc.kill('SIGTERM')
+            killProc()
           }
         }
       } catch {
         if (line.trim()) onOutput({ kind: 'orchestrator', text: line })
       }
+    }
+
+    const finish = (exitCode: number | null) => {
+      if (settled) return
+      settled = true
+      if (!sawResult) {
+        fallback = true
+        if (stderrText) onOutput({ kind: 'orchestrator', text: `claude stderr: ${stderrText}` })
+      }
+      resolve({ exitCode, needsFallback: fallback, sessionId: session?.id })
+    }
+
+    if (resume) {
+      const stopTail = tailLines(resume.logFile, handleLine)
+      killProc = () => process.kill(resume.pid, 'SIGTERM')
+      watchPidExit(resume.pid).then(() => {
+        stopTail()
+        finish(null)
+      })
+      return
+    }
+
+    const logFile = openRunLog('claude', session?.id ?? randomUUID())
+    const proc = spawnClaude(prompt, projectDir, logFile, session, readOnly, designDir)
+    onProcess?.(proc, logFile, 'claude')
+    killProc = () => proc.kill('SIGTERM')
+    const stopTail = tailLines(logFile, handleLine)
+
+    proc.on('error', (err) => {
+      stopTail()
+      reject(err)
+    })
+    proc.on('exit', (code) => {
+      stopTail()
+      finish(code)
+    })
+    proc.stderr?.on('data', (chunk) => {
+      stderrText += chunk.toString()
     })
   })
 }
@@ -582,7 +702,7 @@ async function buildRunnerConfigContent(projectDir: string): Promise<string> {
   })
 }
 
-export async function spawnOpencode(prompt: string, projectDir: string, sessionId?: string, readOnly?: boolean): Promise<ChildProcessByStdio<null, Readable, Readable>> {
+export async function spawnOpencode(prompt: string, projectDir: string, logFile: string, sessionId?: string, readOnly?: boolean): Promise<ChildProcess> {
   const bin = process.env.OPENCODE_BIN || 'opencode'
   const model = process.env.OPENCODE_MODEL || 'opencode/big-pickle'
   // --dir is required, not just spawn()'s cwd option: opencode resolves its working
@@ -596,19 +716,24 @@ export async function spawnOpencode(prompt: string, projectDir: string, sessionI
   // list` shows its ruleset denies "edit" outright) instead of a hand-rolled
   // permission scheme — an explicit deny rule, which survives --auto.
   if (readOnly) args.push('--agent', 'plan')
-  return spawn(bin, args, {
-    cwd: projectDir,
-    env: {
-      ...process.env,
-      PWD: projectDir,
-      ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
-      OPENCODE_CONFIG_CONTENT: await buildRunnerConfigContent(projectDir),
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const outFd = openSync(logFile, 'a')
+  try {
+    return spawn(bin, args, {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        PWD: projectDir,
+        ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
+        OPENCODE_CONFIG_CONTENT: await buildRunnerConfigContent(projectDir),
+      },
+      stdio: ['ignore', outFd, 'pipe'],
+    })
+  } finally {
+    closeSync(outFd)
+  }
 }
 
-export async function spawnKilocode(prompt: string, projectDir: string, sessionId?: string, readOnly?: boolean): Promise<ChildProcessByStdio<null, Readable, Readable>> {
+export async function spawnKilocode(prompt: string, projectDir: string, logFile: string, sessionId?: string, readOnly?: boolean): Promise<ChildProcess> {
   const bin = process.env.KILOCODE_BIN || 'kilocode'
   const model = process.env.KILOCODE_MODEL || 'kilo/kilo-auto/free'
   // --dangerously-skip-permissions, not --auto: kilocode has both, worded differently
@@ -622,16 +747,21 @@ export async function spawnKilocode(prompt: string, projectDir: string, sessionI
   // checkout -b via bash pattern rules. See spawnOpencode for why this beats a
   // hand-rolled permission scheme.
   if (readOnly) args.push('--agent', 'plan')
-  return spawn(bin, args, {
-    cwd: projectDir,
-    env: {
-      ...process.env,
-      PWD: projectDir,
-      ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
-      KILO_CONFIG_CONTENT: await buildRunnerConfigContent(projectDir),
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const outFd = openSync(logFile, 'a')
+  try {
+    return spawn(bin, args, {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        PWD: projectDir,
+        ORCHESTRATOR_URL: `http://127.0.0.1:${process.env.PORT || 4390}`,
+        KILO_CONFIG_CONTENT: await buildRunnerConfigContent(projectDir),
+      },
+      stdio: ['ignore', outFd, 'pipe'],
+    })
+  } finally {
+    closeSync(outFd)
+  }
 }
 
 function summarizeToolInput(input: unknown): string {
@@ -671,7 +801,7 @@ function toolCallEventFromOpencode(part: any): AgentEvent | null {
 // onProperOutput fires once, the first time real text/tool output is seen — runFree
 // uses it to decide whether OpenCode is actually alive or needs to be abandoned.
 function attachOpencodeFamilyStream(
-  proc: ChildProcessByStdio<null, Readable, Readable>,
+  target: { proc: ChildProcess; logFile: string } | { pid: number; logFile: string },
   backend: 'opencode' | 'kilocode',
   onOutput: (event: AgentEvent) => void,
   onProperOutput: () => void,
@@ -691,35 +821,7 @@ function attachOpencodeFamilyStream(
     // "auth problem, or a crash" message that tells the user nothing.
     let rateLimited = false
 
-    proc.on('error', (err) => reject(err))
-
-    proc.on('exit', (code) => {
-      if (!settled) {
-        settled = true
-        // A clean exit (code 0) with zero real output is still a failure, not a
-        // silent success — confirmed live that opencode can exit 0 without ever
-        // emitting a single parseable line (a transient upstream hiccup on its
-        // free-tier model), which previously slipped through as "done" with a
-        // permanently empty message and no error surfaced anywhere.
-        const needsFallback = !sawText
-        if (/Rate limit exceeded/i.test(stderrText)) rateLimited = true
-        if (needsFallback && stderrText) onOutput({ kind: 'orchestrator', text: `stderr: ${stderrText}` })
-        if (rateLimited) {
-          onOutput({
-            kind: 'status',
-            category: 'rate_limited',
-            detail: `${backend === 'kilocode' ? 'Kilo Code' : 'OpenCode'} hit "Rate limit exceeded" — wait for the quota to reset or switch backend.`,
-          })
-        }
-        resolve({ exitCode: code, needsFallback, rateLimited })
-      }
-    })
-
-    proc.stderr.on('data', (chunk) => {
-      stderrText += chunk.toString()
-    })
-
-    readline.createInterface({ input: proc.stdout }).on('line', (line) => {
+    const handleLine = (line: string) => {
       try {
         const msg = JSON.parse(line)
         if (!sawSessionId && msg.sessionID && onSessionId) {
@@ -763,12 +865,54 @@ function attachOpencodeFamilyStream(
       } catch {
         if (line.trim()) onOutput({ kind: 'orchestrator', text: line })
       }
-    })
+    }
+
+    const finish = (exitCode: number | null) => {
+      if (settled) return
+      settled = true
+      // A clean exit (code 0) with zero real output is still a failure, not a
+      // silent success — confirmed live that opencode can exit 0 without ever
+      // emitting a single parseable line (a transient upstream hiccup on its
+      // free-tier model), which previously slipped through as "done" with a
+      // permanently empty message and no error surfaced anywhere.
+      const needsFallback = !sawText
+      if (/Rate limit exceeded/i.test(stderrText)) rateLimited = true
+      if (needsFallback && stderrText) onOutput({ kind: 'orchestrator', text: `stderr: ${stderrText}` })
+      if (rateLimited) {
+        onOutput({
+          kind: 'status',
+          category: 'rate_limited',
+          detail: `${backend === 'kilocode' ? 'Kilo Code' : 'OpenCode'} hit "Rate limit exceeded" — wait for the quota to reset or switch backend.`,
+        })
+      }
+      resolve({ exitCode, needsFallback, rateLimited })
+    }
+
+    const stopTail = tailLines(target.logFile, handleLine)
+
+    if ('proc' in target) {
+      target.proc.on('error', (err) => {
+        stopTail()
+        reject(err)
+      })
+      target.proc.on('exit', (code) => {
+        stopTail()
+        finish(code)
+      })
+      target.proc.stderr?.on('data', (chunk) => {
+        stderrText += chunk.toString()
+      })
+    } else {
+      watchPidExit(target.pid).then(() => {
+        stopTail()
+        finish(null)
+      })
+    }
   })
 }
 
 async function runOpencodeFamily(
-  spawnFn: (prompt: string, projectDir: string, sessionId?: string, readOnly?: boolean) => Promise<ChildProcessByStdio<null, Readable, Readable>>,
+  spawnFn: (prompt: string, projectDir: string, logFile: string, sessionId?: string, readOnly?: boolean) => Promise<ChildProcess>,
   backend: 'opencode' | 'kilocode',
   {
     prompt,
@@ -777,19 +921,30 @@ async function runOpencodeFamily(
     sessionId,
     onProcess,
     readOnly,
+    resume,
   }: {
     prompt: string
     projectDir: string
     onOutput: (event: AgentEvent) => void
     sessionId?: string
-    onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+    onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
     readOnly?: boolean
+    // Reattach to a process from a previous server instance — see
+    // server/run-registry.ts. Skips spawning entirely.
+    resume?: { pid: number; logFile: string }
   },
 ): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; sessionId?: string }> {
-  const proc = await spawnFn(prompt, projectDir, sessionId, readOnly)
-  onProcess?.(proc)
   let capturedId = sessionId
-  const result = await attachOpencodeFamilyStream(proc, backend, onOutput, () => {}, (id) => {
+  if (resume) {
+    const result = await attachOpencodeFamilyStream({ pid: resume.pid, logFile: resume.logFile }, backend, onOutput, () => {}, (id) => {
+      capturedId = id
+    })
+    return { ...result, sessionId: capturedId }
+  }
+  const logFile = openRunLog(backend, sessionId ?? randomUUID())
+  const proc = await spawnFn(prompt, projectDir, logFile, sessionId, readOnly)
+  onProcess?.(proc, logFile, backend)
+  const result = await attachOpencodeFamilyStream({ proc, logFile }, backend, onOutput, () => {}, (id) => {
     capturedId = id
   })
   return { ...result, sessionId: capturedId }
@@ -800,8 +955,9 @@ export function runOpencode(args: {
   projectDir: string
   onOutput: (event: AgentEvent) => void
   sessionId?: string
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
   readOnly?: boolean
+  resume?: { pid: number; logFile: string }
 }): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; sessionId?: string }> {
   return runOpencodeFamily(spawnOpencode, 'opencode', args)
 }
@@ -811,8 +967,9 @@ export function runKilocode(args: {
   projectDir: string
   onOutput: (event: AgentEvent) => void
   sessionId?: string
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
   readOnly?: boolean
+  resume?: { pid: number; logFile: string }
 }): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; sessionId?: string }> {
   return runOpencodeFamily(spawnKilocode, 'kilocode', args)
 }
@@ -833,24 +990,25 @@ const STALL_TIMEOUT_MS = 5 * 60_000
 // no error — previously "trusted to run to completion" the moment it said
 // anything, which left runFree's caller waiting forever with no recovery.
 async function runFreeAttempt(
-  spawnFn: (prompt: string, projectDir: string, sessionId?: string, readOnly?: boolean) => Promise<ChildProcessByStdio<null, Readable, Readable>>,
+  spawnFn: (prompt: string, projectDir: string, logFile: string, sessionId?: string, readOnly?: boolean) => Promise<ChildProcess>,
   backend: 'opencode' | 'kilocode',
   prompt: string,
   projectDir: string,
   sessionId: string | undefined,
   readOnly: boolean | undefined,
   onOutput: (event: AgentEvent) => void,
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void,
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void,
 ): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; stalled: boolean; sessionId?: string }> {
-  const proc = await spawnFn(prompt, projectDir, sessionId, readOnly)
-  onProcess?.(proc)
+  const logFile = openRunLog(backend, sessionId ?? randomUUID())
+  const proc = await spawnFn(prompt, projectDir, logFile, sessionId, readOnly)
+  onProcess?.(proc, logFile, backend)
   let lastEventAt = Date.now()
   let gotOutput = false
   let capturedId = sessionId
   let stalled = false
 
   const resultPromise = attachOpencodeFamilyStream(
-    proc,
+    { proc, logFile },
     backend,
     (event) => {
       lastEventAt = Date.now()
@@ -876,10 +1034,10 @@ async function runFreeAttempt(
   return { ...result, needsFallback: result.needsFallback || stalled, stalled, sessionId: capturedId }
 }
 
-// "Free" tries Kilo Code's hosted free tier first; if it never produces output or
+// "Free" tries OpenCode's free tier first; if it never produces output or
 // goes silent partway through (see runFreeAttempt above), it's abandoned and
-// OpenCode's free tier (a different provider, a different quota pool) is tried
-// instead. Kilo was promoted ahead of OpenCode because OpenCode agents were
+// Kilo Code's free tier (a different provider, a different quota pool) is tried
+// instead. OpenCode was promoted ahead of Kilo Code because Kilo Code agents were
 // observed dying silently mid-run with no error, well past first output.
 export async function runFree({
   prompt,
@@ -901,7 +1059,7 @@ export async function runFree({
   // Fires once per spawn — including a second time if the kilocode->opencode
   // fallback below kicks in, so the caller's stored process reference always
   // tracks whichever process is actually alive.
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
   readOnly?: boolean
 }): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; backend: 'opencode' | 'kilocode'; sessionId?: string }> {
   if (backend === 'kilocode') {
@@ -913,9 +1071,9 @@ export async function runFree({
     return { ...result, backend: 'opencode' }
   }
 
-  const primary = await runFreeAttempt(spawnKilocode, 'kilocode', prompt, projectDir, sessionId, readOnly, onOutput, onProcess)
+  const primary = await runFreeAttempt(spawnOpencode, 'opencode', prompt, projectDir, sessionId, readOnly, onOutput, onProcess)
   if (!primary.needsFallback) {
-    return { ...primary, backend: 'kilocode' }
+    return { ...primary, backend: 'opencode' }
   }
 
   // Structured (kind: 'status'), not an orchestrator note — a whole spawn was
@@ -926,47 +1084,74 @@ export async function runFree({
     kind: 'status',
     category: 'backend_fallback',
     detail: primary.stalled
-      ? `Kilo Code went silent mid-run (no output for ${STALL_TIMEOUT_MS / 60_000} min) — falling back to OpenCode.`
-      : `Kilo Code produced no output within ${FREE_FALLBACK_TIMEOUT_MS / 1000}s (likely the daily free-tier quota is exhausted) — falling back to OpenCode.`,
+      ? `OpenCode went silent mid-run (no output for ${STALL_TIMEOUT_MS / 60_000} min) — falling back to Kilo Code.`
+      : `OpenCode produced no output within ${FREE_FALLBACK_TIMEOUT_MS / 1000}s (likely the daily free-tier quota is exhausted) — falling back to Kilo Code.`,
   })
-  const fallback = await runFreeAttempt(spawnOpencode, 'opencode', prompt, projectDir, undefined, readOnly, onOutput, onProcess)
-  return { ...fallback, backend: 'opencode' }
+  const fallback = await runFreeAttempt(spawnKilocode, 'kilocode', prompt, projectDir, undefined, readOnly, onOutput, onProcess)
+  return { ...fallback, backend: 'kilocode' }
 }
 
 export async function runMockAgent({
   issueId,
   onOutput,
   onProcess,
+  resume,
 }: {
   issueId: string
   onOutput: (event: AgentEvent) => void
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void
+  resume?: { pid: number; logFile: string }
 }): Promise<{ exitCode: number | null; needsFallback: boolean }> {
-  const hookUrl = `http://127.0.0.1:${process.env.PORT || 4390}/hook-event`
-  const script = join(__dirname, 'mock-agent.js')
-  const proc = spawn(process.execPath, [script, issueId, hookUrl], {
-    cwd: SILLAGE_ROOT,
-    env: { ...process.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  onProcess?.(proc)
-  return new Promise((resolve, reject) => {
-    proc.on('error', reject)
-    proc.on('exit', (code) => resolve({ exitCode: code, needsFallback: false }))
-    readline.createInterface({ input: proc.stdout }).on('line', (line) => {
-      try {
-        const msg = JSON.parse(line)
-        if (msg.type === 'assistant') {
-          const parts = Array.isArray(msg.message?.content) ? msg.message.content : []
-          for (const part of parts) {
-            if (part && typeof part === 'object' && part.type === 'text' && part.text) {
-              onOutput({ kind: 'text', text: part.text })
-            }
+  const handleLine = (line: string) => {
+    try {
+      const msg = JSON.parse(line)
+      if (msg.type === 'assistant') {
+        const parts = Array.isArray(msg.message?.content) ? msg.message.content : []
+        for (const part of parts) {
+          if (part && typeof part === 'object' && part.type === 'text' && part.text) {
+            onOutput({ kind: 'text', text: part.text })
           }
         }
-      } catch {
-        if (line.trim()) onOutput({ kind: 'orchestrator', text: line })
       }
+    } catch {
+      if (line.trim()) onOutput({ kind: 'orchestrator', text: line })
+    }
+  }
+
+  if (resume) {
+    return new Promise((resolve) => {
+      const stopTail = tailLines(resume.logFile, handleLine)
+      watchPidExit(resume.pid).then(() => {
+        stopTail()
+        resolve({ exitCode: null, needsFallback: false })
+      })
+    })
+  }
+
+  const hookUrl = `http://127.0.0.1:${process.env.PORT || 4390}/hook-event`
+  const script = join(__dirname, 'mock-agent.js')
+  const logFile = openRunLog('mock', issueId)
+  const outFd = openSync(logFile, 'a')
+  let proc: ChildProcess
+  try {
+    proc = spawn(process.execPath, [script, issueId, hookUrl], {
+      cwd: SILLAGE_ROOT,
+      env: { ...process.env },
+      stdio: ['ignore', outFd, 'pipe'],
+    })
+  } finally {
+    closeSync(outFd)
+  }
+  onProcess?.(proc, logFile, 'mock')
+  return new Promise((resolve, reject) => {
+    const stopTail = tailLines(logFile, handleLine)
+    proc.on('error', (err) => {
+      stopTail()
+      reject(err)
+    })
+    proc.on('exit', (code) => {
+      stopTail()
+      resolve({ exitCode: code, needsFallback: false })
     })
   })
 }

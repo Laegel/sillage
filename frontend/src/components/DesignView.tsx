@@ -1,9 +1,43 @@
 import React from 'react'
+import { DockviewReact, themeAbyss, type DockviewReadyEvent, type IDockviewPanelProps } from 'dockview-react'
+import 'dockview-react/dist/styles/dockview.css'
 import { fetchDesignPreview, fetchDesignControls } from '../api.ts'
-import { isColorToken, parseDesignTokens } from '../lib/designTokens.ts'
-import type { DesignSession, Issue, Project } from '../types.ts'
+import { parseDesignTokens, type DesignToken } from '../lib/designTokens.ts'
+import type { ChatMessage, DesignSession, Issue, Project } from '../types.ts'
 import DesignChat from './DesignChat.tsx'
-import DesignPreview from './DesignPreview.tsx'
+import PreviewPanel from './panels/PreviewPanel.tsx'
+import ControlsPanel from './panels/ControlsPanel.tsx'
+import TokensPanel from './panels/TokensPanel.tsx'
+
+type ChatPanelParams = {
+  sessionId: string
+  messages: ChatMessage[]
+  running: boolean
+  issueId?: string
+  committing: boolean
+  onSend: (message: string, images?: string[]) => void
+  onCommit: () => void
+}
+type PreviewPanelParams = {
+  html: string | null | undefined
+  error: string
+  onRefresh: () => void
+  onIframeReady: (el: HTMLIFrameElement | null) => void
+}
+type ControlsPanelParams = { controlsHtml: string | null | undefined }
+type TokensPanelParams = { tokens: DesignToken[] }
+
+// Stable across renders — each panel component reads everything from
+// `props.params`, so this map never needs to change identity. Defined once
+// at module scope rather than memoized inside DesignView.
+const dockComponents = {
+  chat: (props: IDockviewPanelProps<ChatPanelParams>) => <DesignChat key={props.params.sessionId} {...props.params} />,
+  preview: (props: IDockviewPanelProps<PreviewPanelParams>) => <PreviewPanel {...props.params} />,
+  controls: (props: IDockviewPanelProps<ControlsPanelParams>) => <ControlsPanel {...props.params} />,
+  tokens: (props: IDockviewPanelProps<TokensPanelParams>) => <TokensPanel {...props.params} />,
+}
+
+const DESIGN_LAYOUT_KEY = 'sillage.designLayout'
 
 // Mirrors IdeationView's isBlocked — a session is "blocked" iff its last
 // message is the assistant's and its most recent status event still needs
@@ -103,6 +137,118 @@ export default function DesignView({
 
   const tokens = React.useMemo(() => parseDesignTokens(html ?? ''), [html])
 
+  // Bridges the controls iframe's postMessage commands into the preview
+  // iframe now that they're separate dockview panels instead of siblings in
+  // one flex row — moved up here since DesignView is the nearest shared
+  // parent, same relay logic that used to live in DesignPreview.tsx.
+  const previewIframeRef = React.useRef<HTMLIFrameElement | null>(null)
+  React.useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data
+      if (!data || typeof data !== 'object' || data.type !== 'design-command') return
+      previewIframeRef.current?.contentWindow?.postMessage(data, '*')
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
+
+  // Only defined while a session is selected — the dock is only ever
+  // rendered inside the `selected &&` branch below, so these are guaranteed
+  // non-null by the time dockview actually mounts/updates panels.
+  const chatParams: ChatPanelParams | null = selected
+    ? {
+        sessionId: selected.id,
+        messages: selected.messages,
+        running: running.has(selected.id),
+        issueId: selected.issueId,
+        committing: committing.has(selected.id),
+        onSend: (message, images) => onSend(selected.id, message, images),
+        onCommit: () => onCommit(selected.id),
+      }
+    : null
+  const previewParams: PreviewPanelParams = {
+    html,
+    error: previewError,
+    onRefresh: loadPreview,
+    onIframeReady: (el) => (previewIframeRef.current = el),
+  }
+  const controlsParams: ControlsPanelParams = { controlsHtml }
+  const tokensParams: TokensPanelParams = { tokens }
+
+  // Keeps refs so `onReady` (fired once by dockview, never re-run — its own
+  // deps stay `[]` so the panel arrangement isn't rebuilt on every session
+  // switch) can still read the freshest params at the moment it actually
+  // constructs the initial panels.
+  const chatParamsRef = React.useRef(chatParams)
+  chatParamsRef.current = chatParams
+  const previewParamsRef = React.useRef(previewParams)
+  previewParamsRef.current = previewParams
+  const controlsParamsRef = React.useRef(controlsParams)
+  controlsParamsRef.current = controlsParams
+  const tokensParamsRef = React.useRef(tokensParams)
+  tokensParamsRef.current = tokensParams
+
+  const dockApiRef = React.useRef<DockviewReadyEvent['api'] | null>(null)
+
+  // Keeps every already-open panel's content in sync as chat/preview/tokens
+  // state changes — dockview only reads `params` again when explicitly told
+  // to via `updateParameters`, it won't re-render a panel just because
+  // DesignView re-rendered.
+  React.useEffect(() => {
+    const api = dockApiRef.current
+    if (!api) return
+    if (chatParams) api.getPanel('chat')?.api.updateParameters(chatParams)
+    api.getPanel('preview')?.api.updateParameters(previewParams)
+    api.getPanel('controls')?.api.updateParameters(controlsParams)
+    api.getPanel('tokens')?.api.updateParameters(tokensParams)
+  }, [chatParams, previewParams, controlsParams, tokensParams])
+
+  const onReady = React.useCallback((event: DockviewReadyEvent) => {
+    const api = event.api
+    dockApiRef.current = api
+    const saved = localStorage.getItem(DESIGN_LAYOUT_KEY)
+    if (saved) {
+      try {
+        api.fromJSON(JSON.parse(saved))
+      } catch {
+        // corrupt/incompatible saved layout — fall through and build the
+        // default arrangement below instead
+      }
+    }
+    if (!api.getPanel('chat')) {
+      api.addPanel({ id: 'chat', component: 'chat', title: 'Chat', params: chatParamsRef.current! })
+    }
+    if (!api.getPanel('preview')) {
+      api.addPanel({
+        id: 'preview',
+        component: 'preview',
+        title: 'Preview',
+        params: previewParamsRef.current,
+        position: { referencePanel: 'chat', direction: 'right' },
+      })
+    }
+    if (!api.getPanel('controls')) {
+      api.addPanel({
+        id: 'controls',
+        component: 'controls',
+        title: 'Controls',
+        params: controlsParamsRef.current,
+        position: { referencePanel: 'preview', direction: 'right' },
+        initialWidth: 320,
+      })
+    }
+    if (!api.getPanel('tokens')) {
+      api.addPanel({
+        id: 'tokens',
+        component: 'tokens',
+        title: 'Tokens',
+        params: tokensParamsRef.current,
+        position: { referencePanel: 'controls', direction: 'within' },
+      })
+    }
+    api.onDidLayoutChange(() => localStorage.setItem(DESIGN_LAYOUT_KEY, JSON.stringify(api.toJSON())))
+  }, [])
+
   return (
     <section className="design-view">
       <div className="design-toolbar">
@@ -192,32 +338,8 @@ export default function DesignView({
                 </select>
               </div>
             )}
-            <details className="synthesis-panel design-tokens-panel">
-              <summary className="synthesis-panel-header">
-                <span className="synthesis-panel-title">Design tokens</span>
-              </summary>
-              <div className="synthesis-panel-body design-tokens-list">
-                {tokens.length === 0 && <p className="hint">No design tokens declared in this mockup yet.</p>}
-                {tokens.map((t) => (
-                  <div key={t.name} className="design-token-row">
-                    {isColorToken(t.value) && <span className="design-token-swatch" style={{ background: t.value }} />}
-                    <code className="design-token-name">{t.name}</code>
-                    <code className="design-token-value">{t.value}</code>
-                  </div>
-                ))}
-              </div>
-            </details>
-            <div className="design-split">
-              <DesignChat
-                key={selected.id}
-                messages={selected.messages}
-                running={running.has(selected.id)}
-                issueId={selected.issueId}
-                committing={committing.has(selected.id)}
-                onSend={(message, images) => onSend(selected.id, message, images)}
-                onCommit={() => onCommit(selected.id)}
-              />
-              <DesignPreview html={html} controlsHtml={controlsHtml} error={previewError} onRefresh={loadPreview} />
+            <div className="design-dock">
+              <DockviewReact components={dockComponents} onReady={onReady} theme={themeAbyss} />
             </div>
           </>
         ) : (

@@ -28,3 +28,9 @@ export function saveChatSession(issueId: string, backend: ChatBackend, sessionId
   store[issueId] = { backend, sessionId }
   writeFileSync(STORE_FILE, JSON.stringify(store, null, 2))
 }
+
+export function deleteChatSession(issueId: string): void {
+  const store = loadStore()
+  delete store[issueId]
+  writeFileSync(STORE_FILE, JSON.stringify(store, null, 2))
+}

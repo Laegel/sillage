@@ -1,4 +1,4 @@
-import type { Comment, Issue, IssueTransition, Project, SubIssue, SynthesisEntry, UsageEntry, Plan } from './types.ts'
+import type { Comment, Issue, IssueTransition, Project, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -77,12 +77,4 @@ export function fetchDesignPreview(sessionId: string, projectId: string, issueId
 export function fetchDesignControls(sessionId: string, projectId: string, issueId?: string): Promise<{ html: string | null }> {
   const params = new URLSearchParams({ projectId, ...(issueId ? { issueId } : {}) })
   return request(`/api/design/${sessionId}/controls?${params}`)
-}
-
-export function fetchPlans(issueId: string): Promise<{ plans: Plan[] }> {
-  return request(`/api/plans?issueId=${encodeURIComponent(issueId)}`)
-}
-
-export function applyPlan(planId: string): Promise<{ plan: Plan }> {
-  return request(`/api/plans/${planId}/apply`, { method: 'POST' })
 }

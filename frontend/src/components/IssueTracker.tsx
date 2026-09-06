@@ -7,18 +7,24 @@ export default function IssueTracker({
   projects,
   selectedId,
   runningIds,
+  loading,
+  loadError,
   onSelect,
   onCreate,
   onMove,
+  onRetry,
 }: {
   issues: Issue[]
   columns: string[]
   projects: Project[]
   selectedId: string | null
   runningIds: Set<string>
+  loading: boolean
+  loadError: string
   onSelect: (issue: Issue) => void
   onCreate: (payload: { title: string; description?: string; projectId?: string }) => Promise<void>
   onMove: (issueId: string, status: string) => void
+  onRetry: () => void
 }) {
   const [title, setTitle] = React.useState('')
   const [description, setDescription] = React.useState('')
@@ -107,6 +113,16 @@ export default function IssueTracker({
         </div>
       )}
 
+      {loading && <div className="tracker-status">Loading issues…</div>}
+      {loadError && (
+        <div className="tracker-status tracker-error">
+          {loadError}
+          <button type="button" onClick={onRetry}>
+            Retry
+          </button>
+        </div>
+      )}
+
       <div className="columns">
         {columns.map((column) => {
           const columnIssues = visibleIssues.filter((issue) => issue.status === column)
@@ -130,13 +146,13 @@ export default function IssueTracker({
                   key={issue.id}
                   draggable
                   onDragStart={(e) => e.dataTransfer.setData('text/plain', issue.id)}
-                  className={`issue-card ${selectedId === issue.id ? 'selected' : ''} ${runningIds.has(issue.id) ? 'running' : ''}`}
+                  className={`issue-card ${selectedId === issue.id ? 'selected' : ''} ${runningIds.has(issue.id) ? 'running' : ''} ${issue.isSubIssue ? 'is-subissue' : ''}`}
                   onClick={() => onSelect(issue)}
                 >
                   <div className="issue-id">{issue.id}</div>
                   <div className="issue-title">{issue.title}</div>
                   {issue.description && <div className="issue-description">{issue.description}</div>}
-                  {(issue.project || issue.milestone || issue.priority > 0) && (
+                  {(issue.project || issue.milestone || issue.priority > 0 || issue.hasSubIssues) && (
                     <div className="issue-meta">
                       {issue.project && (
                         <span className="issue-meta-badge project">▤ {projectName(issue.project)}</span>
@@ -147,6 +163,7 @@ export default function IssueTracker({
                           ● {issue.priorityLabel}
                         </span>
                       )}
+                      {issue.hasSubIssues && <span className="issue-meta-badge subissues">⊟ Sub-issues</span>}
                     </div>
                   )}
                   {issue.labels.length > 0 && (
