@@ -1,4 +1,5 @@
 import type { DesignSession } from '../types.ts'
+import { saveHistoryStore } from './historyStore.ts'
 
 const STORAGE_KEY = 'sillage.designHistory.v1'
 
@@ -12,5 +13,5 @@ export function loadDesignSessions(): Record<string, DesignSession> {
 }
 
 export function saveDesignSessions(sessions: Record<string, DesignSession>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions))
+  saveHistoryStore(STORAGE_KEY, sessions)
 }

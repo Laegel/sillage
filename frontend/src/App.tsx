@@ -125,7 +125,11 @@ export default function App() {
       setIssuesError('')
       setIssuesLoading(false)
     } catch (err) {
-      if (attempt < 2) {
+      // A 429 (Linear's own hourly quota, distinct from the transient "Fetch
+      // failed" glitches retried below) can't be fixed by retrying — it just
+      // burns more of an already-exhausted budget. Fail immediately instead.
+      const status = (err as { status?: number } | undefined)?.status
+      if (status !== 429 && attempt < 2) {
         setTimeout(() => refresh(attempt + 1), 2000)
         return
       }

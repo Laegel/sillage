@@ -246,7 +246,14 @@ export default function DesignView({
         position: { referencePanel: 'controls', direction: 'within' },
       })
     }
-    api.onDidLayoutChange(() => localStorage.setItem(DESIGN_LAYOUT_KEY, JSON.stringify(api.toJSON())))
+    api.onDidLayoutChange(() => {
+      try {
+        localStorage.setItem(DESIGN_LAYOUT_KEY, JSON.stringify(api.toJSON()))
+      } catch {
+        // Quota exceeded — losing the saved panel layout is harmless (it just
+        // falls back to the default arrangement next load), unlike crashing.
+      }
+    })
   }, [])
 
   return (

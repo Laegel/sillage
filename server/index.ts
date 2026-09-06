@@ -387,7 +387,11 @@ async function handleLinearApi(req: IncomingMessage, res: ServerResponse, path: 
     }
     return json(res, 404, { error: 'not found' })
   } catch (err: any) {
-    return json(res, 500, { error: err.message })
+    // Distinguished from a generic 500 so the frontend can skip its retry —
+    // retrying against an exhausted hourly quota can't succeed and only
+    // burns more of it.
+    const status = /rate limit exceeded/i.test(err.message || '') ? 429 : 500
+    return json(res, status, { error: err.message })
   }
 }
 

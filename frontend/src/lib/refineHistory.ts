@@ -1,4 +1,5 @@
 import type { ChatMessage } from '../types.ts'
+import { saveHistoryStore } from './historyStore.ts'
 
 const STORAGE_KEY = 'sillage.refineHistory.v1'
 
@@ -17,7 +18,7 @@ export function loadRefineHistory(): Record<string, RefineHistoryEntry> {
 }
 
 export function saveRefineHistory(store: Record<string, RefineHistoryEntry>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(store))
+  saveHistoryStore(STORAGE_KEY, store)
 }
 
 export function toRefineHistoryStore(

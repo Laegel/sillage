@@ -1,4 +1,5 @@
 import type { DriverSession } from '../types.ts'
+import { saveHistoryStore } from './historyStore.ts'
 
 const STORAGE_KEY = 'sillage.driverHistory.v1'
 
@@ -12,5 +13,5 @@ export function loadDriverSessions(): Record<string, DriverSession> {
 }
 
 export function saveDriverSessions(sessions: Record<string, DriverSession>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions))
+  saveHistoryStore(STORAGE_KEY, sessions)
 }

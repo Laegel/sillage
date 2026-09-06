@@ -7,3 +7,5 @@ active-runs.json
 run-logs/
 usage-log.jsonl
 uploads/
+friction-log.jsonl
+plans.json

@@ -1,4 +1,5 @@
 import type { IdeationSession } from '../types.ts'
+import { saveHistoryStore } from './historyStore.ts'
 
 const STORAGE_KEY = 'sillage.ideationHistory.v1'
 
@@ -12,5 +13,5 @@ export function loadIdeationSessions(): Record<string, IdeationSession> {
 }
 
 export function saveIdeationSessions(sessions: Record<string, IdeationSession>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions))
+  saveHistoryStore(STORAGE_KEY, sessions)
 }

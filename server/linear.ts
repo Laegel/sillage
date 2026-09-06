@@ -50,11 +50,13 @@ export class LinearStore implements LinearStoreLike {
   // Read-through cache for the Linear SDK calls that fan out per-issue
   // (listIssues/getIssue do 3-4 extra round trips each for state/milestone/
   // labels) — under load this N+1 pattern is what produces intermittent
-  // "Fetch failed" errors. TTL is a safety net for changes made outside this
-  // server (directly in Linear's UI); invalidateIssue() below is the fast
-  // path for everything driven through this server's own mutations/webhook.
+  // "Fetch failed" errors. TTL is only a safety net for changes made outside
+  // this server (directly in Linear's UI); invalidateIssue() below is the
+  // immediate path for everything driven through this server's own
+  // mutations/webhook, so a long TTL doesn't risk showing stale data for
+  // anything a user actually does through this app.
   private cache = new Map<string, { value: unknown; expiresAt: number }>()
-  private readonly CACHE_TTL_MS = 30_000
+  private readonly CACHE_TTL_MS = 5 * 60_000
 
   private async withCache<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const hit = this.cache.get(key)
