@@ -1,6 +1,10 @@
+import { execFile } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MAP_FILE = resolve(__dirname, '..', 'project-map.json')
@@ -8,7 +12,13 @@ const MAP_FILE = resolve(__dirname, '..', 'project-map.json')
 interface ProjectMapFile {
   PROJECTS_ROOT: string
   projects: Record<string, string>
+  requiredTools?: Record<string, string[]>
 }
+
+// The orchestrator's own mergePr() shells out to `gh` directly, regardless of
+// what any project declares — checked for every project, not just ones that
+// list it under requiredTools.
+const BASE_REQUIRED_TOOLS = ['gh']
 
 function loadMap(): ProjectMapFile {
   if (!existsSync(MAP_FILE)) {
@@ -38,4 +48,28 @@ export function resolveProjectDir(linearProjectId: string | undefined): string {
     throw new Error(`Mapped folder for Linear project ${linearProjectId} does not exist: ${resolved}`)
   }
   return resolved
+}
+
+function requiredToolsFor(folder: string): string[] {
+  const map = loadMap()
+  return map.requiredTools?.[folder] ?? []
+}
+
+// Runs once before any agent process is spawned for this project — a run
+// that's missing a tool it needs would otherwise waste minutes limping
+// through exploration before failing (or silently no-op'ing) deep inside
+// the agent's own turn instead of failing fast, clearly, up front.
+export async function checkRequiredTools(folder: string): Promise<void> {
+  const tools = [...new Set([...BASE_REQUIRED_TOOLS, ...requiredToolsFor(folder)])]
+  const missing: string[] = []
+  for (const tool of tools) {
+    try {
+      await execFileAsync('which', [tool])
+    } catch {
+      missing.push(tool)
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(`Missing required tool(s) for ${folder}: ${missing.join(', ')}. Install them or update project-map.json.`)
+  }
 }

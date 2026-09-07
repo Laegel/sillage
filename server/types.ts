@@ -11,11 +11,33 @@ export interface Issue {
   priorityLabel: string
   milestone?: string
   labels: IssueLabel[]
+  isSubIssue: boolean
+  hasSubIssues: boolean
+  parent?: SubIssue
 }
 
 export interface IssueLabel {
   name: string
   color: string
+}
+
+export interface SubIssue {
+  id: string
+  title: string
+  status: string
+  url: string
+}
+
+export interface IssueTransition {
+  fromStatus?: string
+  toStatus: string
+  timestamp: string
+}
+
+export interface Comment {
+  authorName: string
+  createdAt: string
+  body: string
 }
 
 export interface Project {
@@ -55,6 +77,24 @@ export type AgentEvent =
   | { kind: 'status'; category: string; detail: string; needsAction?: string }
   | { kind: 'separator' }
   | { kind: 'orchestrator'; text: string }
+  | {
+      kind: 'usage'
+      backend: string
+      cost?: number
+      tokens?: { input?: number; output?: number; cacheRead?: number }
+    }
+
+// Manual: the Driver session UI drives one action at a time, waiting for the
+// user. Autonomous: the Driver scans the backlog and acts on its own.
+export type DriverMode = 'manual' | 'autonomous'
+
+export type DriverActionKind = 'refine' | 'implement' | 'stop' | 'restart' | 'release' | 'merge' | 'flag' | 'create'
+
+// 'create' has no existing issue yet — title is its required field, in place
+// of issueId, which every other kind needs.
+export type DriverAction =
+  | { action: 'create'; title: string; description?: string }
+  | { action: Exclude<DriverActionKind, 'create'>; issueId: string; task?: string; reason?: string }
 
 export interface LinearStoreLike {
   listIssues(): Promise<Issue[]>
@@ -66,4 +106,8 @@ export interface LinearStoreLike {
   attachPr(identifier: string, prUrl: string): Promise<boolean>
   listProjects(): Promise<Project[]>
   resolveAgentChoice(identifier: string): Promise<AgentChoice>
+  listComments(identifier: string): Promise<Comment[]>
+  listSubIssues(identifier: string): Promise<SubIssue[]>
+  listIssueHistory(identifier: string): Promise<IssueTransition[]>
+  invalidateIssue(identifier: string): void
 }

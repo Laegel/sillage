@@ -3,3 +3,9 @@ dist/
 .env
 project-map.json
 chat-sessions.json
+active-runs.json
+run-logs/
+usage-log.jsonl
+uploads/
+friction-log.jsonl
+plans.json

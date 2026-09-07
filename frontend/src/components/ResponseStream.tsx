@@ -28,7 +28,6 @@ export default function ResponseStream({ streams, onClear }: { streams: StreamEn
         <div key={stream.issueId} className={`stream-entry ${stream.done ? 'done' : ''}`}>
           <div className="stream-entry-title">
             <span className="issue-id">{stream.issueId}</span>
-            <span className="stream-classification">{stream.classification}</span>
             {stream.errored ? (
               <span className="stream-status error">failed</span>
             ) : stream.done ? (

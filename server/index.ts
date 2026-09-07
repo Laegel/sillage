@@ -3,9 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { execFile, type ChildProcessByStdio } from 'node:child_process'
+import { execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
-import type { Readable } from 'node:stream'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { getLinearStore, STATUS_COLUMNS } from './linear.ts'
 import { startWebhookListener } from './webhook-listener.ts'
@@ -33,6 +32,7 @@ import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansFor
 import { appendUsage, loadUsage } from './usage-store.ts'
 import { getSynthesis, saveSynthesis, type SynthesisEntry } from './synthesis-store.ts'
 import { classifyFriction, appendFriction } from './friction-store.ts'
+import { loadActiveRuns, saveActiveRun, clearActiveRun, type RunBackend, type RunKind, type ActiveRunRecord } from './run-registry.ts'
 import type { AgentEvent, DriverAction, DriverActionKind, DriverMode, Issue } from './types.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -47,7 +47,10 @@ type ActiveState = {
   task: string
   events: AgentEvent[]
   done: boolean
-  proc: ChildProcessByStdio<null, Readable, Readable> | null
+  proc: ChildProcess | null
+  // Set for a recovered run, which has no live ChildProcess to kill — lets
+  // stop/restart still work by pid instead of silently no-op'ing.
+  pid?: number
   stopped: boolean
   pendingRestart: boolean
   lastEventAt: number
@@ -55,10 +58,10 @@ type ActiveState = {
 
 const clients = new Set<WebSocket>()
 const active = new Map<string, ActiveState>()
-const activeRefine = new Map<string, { issueId: string; lastEventAt: number; textParts: string[] }>()
-const activeIdeation = new Map<string, { sessionId: string }>()
-const activeDriver = new Map<string, { sessionId: string }>()
-const activeDesign = new Map<string, { sessionId: string }>()
+const activeRefine = new Map<string, { issueId: string; lastEventAt: number; textParts: string[]; events: AgentEvent[] }>()
+const activeIdeation = new Map<string, { sessionId: string; events: AgentEvent[] }>()
+const activeDriver = new Map<string, { sessionId: string; events: AgentEvent[] }>()
+const activeDesign = new Map<string, { sessionId: string; events: AgentEvent[] }>()
 // Which Linear issue (if any) a design session is linked to — drives its
 // output folder and whether "Commit to branch" is available. Memory-only:
 // the frontend owns the durable copy (persisted in its own localStorage
@@ -73,10 +76,11 @@ const driverAutonomyBudget = new Map<string, number>()
 
 // A Driver session's set of cards it's actively watching end-to-end, plus a
 // reverse index for O(1) "who owns this card" lookups from inside
-// broadcast(). Memory-only like the maps above — persisting ownership
-// alone wouldn't resurrect a dead child process after a restart, it'd just
-// leave a session "watching" a run that silently ended; the real gap (agent
-// runs aren't resumable across a restart) is pre-existing and out of scope.
+// broadcast(). Memory-only like the maps above — but unlike a run's own
+// active* entry, ownership doesn't need to survive a restart to stay correct:
+// recoverActiveRuns() re-populates active*/activeRefine/etc. from disk, and
+// this map gets rebuilt the normal way as those recovered runs finish and
+// their outcomes flow through executeDriverActions/claimOwnership again.
 const driverOwnership = new Map<string, Set<string>>()
 const issueOwner = new Map<string, string>()
 // Server-initiated reprompts (event-driven, timer-driven) have no client WS
@@ -383,7 +387,11 @@ async function handleLinearApi(req: IncomingMessage, res: ServerResponse, path: 
     }
     return json(res, 404, { error: 'not found' })
   } catch (err: any) {
-    return json(res, 500, { error: err.message })
+    // Distinguished from a generic 500 so the frontend can skip its retry —
+    // retrying against an exhausted hourly quota can't succeed and only
+    // burns more of it.
+    const status = /rate limit exceeded/i.test(err.message || '') ? 429 : 500
+    return json(res, status, { error: err.message })
   }
 }
 
@@ -406,6 +414,23 @@ async function gitSnapshot(projectDir: string): Promise<{ head: string; dirty: b
   }
 }
 
+// Persists {pid, logFile} for a just-spawned agent process so recoverActiveRuns()
+// can find and reattach to it if this server restarts mid-run — see
+// server/run-registry.ts and agent.ts's openRunLog/tailLines for the other half.
+// Called from every run* function's onProcess callback, right after spawn.
+function registerRun(
+  key: string,
+  kind: RunKind,
+  backend: RunBackend,
+  sessionId: string | undefined,
+  proc: ChildProcess,
+  logFile: string,
+  projectId?: string,
+): void {
+  if (typeof proc.pid !== 'number') return
+  saveActiveRun({ key, kind, pid: proc.pid, logFile, backend, sessionId, projectId })
+}
+
 async function runTask({
   issueId,
   task,
@@ -416,7 +441,7 @@ async function runTask({
   issueId: string
   task: string
   onOutput: (event: AgentEvent) => void
-  onProcess?: (proc: ChildProcessByStdio<null, Readable, Readable>) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: RunBackend, sessionId: string | undefined) => void
   // Skips the resume-if-one-exists check below — a deliberate clean-slate
   // run, e.g. when a prior attempt's session went off in a bad direction and
   // resuming it would just drag the same dead end back in.
@@ -437,7 +462,7 @@ async function runTask({
 
   if (process.env.USE_MOCK_AGENT === 'true') {
     onOutput({ kind: 'orchestrator', text: 'USE_MOCK_AGENT=true — using simulated agent for the demo.' })
-    return runMockAgent({ issueId, onOutput, onProcess })
+    return runMockAgent({ issueId, onOutput, onProcess: (proc, logFile) => onProcess?.(proc, logFile, 'mock', undefined) })
   }
 
   const projectDir = resolveProjectDir(issue.project)
@@ -482,30 +507,60 @@ async function runTask({
     // re-exploring the same files from scratch.
     if (existing?.backend === 'claude') {
       agentLabel = 'Claude Code (resumed session)'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runClaude({ prompt, projectDir, onOutput, onProcess, session: { id: existing.sessionId, resume: true } })
       backend = 'claude'
+      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+      run = await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: existing.sessionId, resume: true },
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+      })
     } else if (existing?.backend === 'opencode') {
       agentLabel = 'OpenCode (resumed session)'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runOpencode({ prompt, projectDir, onOutput, onProcess, sessionId: existing.sessionId })
       backend = 'opencode'
+      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+      run = await runOpencode({
+        prompt,
+        projectDir,
+        onOutput,
+        sessionId: existing.sessionId,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+      })
     } else if (existing?.backend === 'kilocode') {
       agentLabel = 'Kilo Code (resumed session)'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runKilocode({ prompt, projectDir, onOutput, onProcess, sessionId: existing.sessionId })
       backend = 'kilocode'
+      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+      run = await runKilocode({
+        prompt,
+        projectDir,
+        onOutput,
+        sessionId: existing.sessionId,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+      })
     } else {
       const agentChoice = await linear.resolveAgentChoice(issueId)
       if (agentChoice === 'claude') {
         agentLabel = 'Claude Code'
-        onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-        run = await runClaude({ prompt, projectDir, onOutput, onProcess, session: { id: randomUUID(), resume: false } })
         backend = 'claude'
-      } else {
-        agentLabel = 'Free (Kilo Code, falling back to OpenCode if needed)'
+        const freshId = randomUUID()
         onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-        const freeRun = await runFree({ prompt, projectDir, onOutput, onProcess })
+        run = await runClaude({
+          prompt,
+          projectDir,
+          onOutput,
+          session: { id: freshId, resume: false },
+          onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+        })
+      } else {
+        agentLabel = 'Free (OpenCode, falling back to Kilo Code if needed)'
+        onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+        const freeRun = await runFree({
+          prompt,
+          projectDir,
+          onOutput,
+          onProcess: (proc, logFile, freeBackend) => onProcess?.(proc, logFile, freeBackend, undefined),
+        })
         run = freeRun
         backend = freeRun.backend
       }
@@ -554,8 +609,10 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
       state.lastEventAt = Date.now()
       broadcast({ type: 'output', issueId, event })
     },
-    onProcess: (proc) => {
+    onProcess: (proc, logFile, backend, sessionId) => {
       state.proc = proc
+      state.pid = proc.pid
+      registerRun(issueId, 'task', backend, sessionId, proc, logFile)
     },
   })
     .then((result) => {
@@ -579,6 +636,7 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
     })
     .finally(() => {
       active.delete(issueId)
+      clearActiveRun(issueId)
       if (state.pendingRestart) startRun(issueId, state.task)
     })
 
@@ -601,14 +659,51 @@ function handleStart(ws: WebSocket, payload: any) {
   send(ws, { type: 'started', issueId })
 }
 
+// Lets a finished run be corrected without starting over: startRun/runTask
+// already resume the issue's existing implement: chat session when one
+// exists, so the feedback text lands as the next turn with full context of
+// what was already built, rather than a fresh describe-the-task prompt.
+// Posting the comment is best-effort — a Linear hiccup here shouldn't block
+// the actual re-run, same tolerance runTask already has for its own
+// setStatus('In Progress') call.
+function handleFeedback(ws: WebSocket, payload: any) {
+  const issueId = payload.issueId
+  const message = payload.message
+  if (!issueId || !message) {
+    send(ws, { type: 'error', message: 'issueId and message are required' })
+    return
+  }
+  if (active.has(issueId)) {
+    rejectBusy(ws, { issueId }, 'A task is already running for this issue')
+    return
+  }
+
+  linear.addComment(issueId, `Feedback on this implementation:\n\n${message}`).catch((err: any) => {
+    console.error(`[feedback ${issueId}] comment failed:`, err)
+  })
+  startRun(issueId, message)
+  send(ws, { type: 'started', issueId })
+}
+
 // Stop leaves the issue's Linear status untouched — runTask already moved it
 // to "In Progress" and nothing here should second-guess that; only a genuinely
 // finished/blocked run changes status again, same as an ordinary completion.
+function killActiveState(state: ActiveState): void {
+  if (state.proc) state.proc.kill('SIGTERM')
+  else if (state.pid) {
+    try {
+      process.kill(state.pid, 'SIGTERM')
+    } catch {
+      // already gone
+    }
+  }
+}
+
 function stopIssueRun(issueId: string): boolean {
   const state = active.get(issueId)
   if (!state) return false
   state.stopped = true
-  state.proc?.kill('SIGTERM')
+  killActiveState(state)
   return true
 }
 
@@ -617,7 +712,7 @@ function restartIssueRun(issueId: string): boolean {
   if (!state) return false
   state.stopped = true
   state.pendingRestart = true
-  state.proc?.kill('SIGTERM')
+  killActiveState(state)
   return true
 }
 
@@ -642,10 +737,12 @@ async function runRefineTurn({
   issueId,
   prompt,
   onOutput,
+  onProcess,
 }: {
   issueId: string
   prompt: string
   onOutput: (event: AgentEvent) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: RunBackend, sessionId: string | undefined) => void
 }) {
   const issue = await linear.getIssue(issueId)
   const projectDir = resolveProjectDir(issue.project)
@@ -658,21 +755,61 @@ async function runRefineTurn({
   // A refine turn must never write — see server/agent.ts's spawnClaude/spawnOpencode/
   // spawnKilocode for how readOnly is mechanically enforced per backend.
   if (existing?.backend === 'claude') {
-    run = await runClaude({ prompt, projectDir, onOutput, session: { id: existing.sessionId, resume: true }, readOnly: true })
     backend = 'claude'
+    run = await runClaude({
+      prompt,
+      projectDir,
+      onOutput,
+      session: { id: existing.sessionId, resume: true },
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else if (existing?.backend === 'opencode') {
-    run = await runOpencode({ prompt, projectDir, onOutput, sessionId: existing.sessionId, readOnly: true })
     backend = 'opencode'
+    run = await runOpencode({
+      prompt,
+      projectDir,
+      onOutput,
+      sessionId: existing.sessionId,
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else if (existing?.backend === 'kilocode') {
-    run = await runKilocode({ prompt, projectDir, onOutput, sessionId: existing.sessionId, readOnly: true })
     backend = 'kilocode'
+    run = await runKilocode({
+      prompt,
+      projectDir,
+      onOutput,
+      sessionId: existing.sessionId,
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else {
     const agentChoice = await linear.resolveAgentChoice(issueId)
     if (agentChoice === 'claude') {
-      run = await runClaude({ prompt, projectDir, onOutput, session: { id: randomUUID(), resume: false }, readOnly: true })
       backend = 'claude'
+      const freshId = randomUUID()
+      run = await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: freshId, resume: false },
+        readOnly: true,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+      })
     } else {
-      const freeRun = await runFree({ prompt, projectDir, onOutput, readOnly: true })
+      // The session id negotiated by whichever free backend answers isn't known
+      // until it streams its first sessionID line (see attachOpencodeFamilyStream),
+      // well after this onProcess fires — registerRun below is fine with an
+      // initially-undefined sessionId, since a recovered run's tailer re-reads
+      // the whole log from byte 0 and re-derives it anyway.
+      const freeRun = await runFree({
+        prompt,
+        projectDir,
+        onOutput,
+        readOnly: true,
+        onProcess: (proc, logFile, freeBackend) => onProcess?.(proc, logFile, freeBackend, undefined),
+      })
       run = freeRun
       backend = freeRun.backend
     }
@@ -698,7 +835,7 @@ function runRefine(
   onDone?: (result: { ok: boolean; message: string }) => void,
 ): boolean {
   if (activeRefine.has(issueId)) return false
-  activeRefine.set(issueId, { issueId, lastEventAt: Date.now(), textParts: [] })
+  activeRefine.set(issueId, { issueId, lastEventAt: Date.now(), textParts: [], events: [] })
 
   ;(async () => {
     try {
@@ -711,10 +848,12 @@ function runRefine(
           const entry = activeRefine.get(issueId)
           if (entry) {
             entry.lastEventAt = Date.now()
+            entry.events.push(event)
             if (event.kind === 'text') entry.textParts.push(event.text)
           }
           broadcast({ type: 'refine_output', issueId, event })
         },
+        onProcess: (proc, logFile, backend, sessionId) => registerRun(issueId, 'refine', backend, sessionId, proc, logFile),
       })
       // The Driver's later ownership status-update turn (routeDriverSignal ->
       // OWNERSHIP_TRIGGER_REASONS.refine_turn_done) is the only other place this
@@ -733,6 +872,7 @@ function runRefine(
       onDone?.({ ok: false, message: err.message })
     } finally {
       activeRefine.delete(issueId)
+      clearActiveRun(issueId)
     }
   })()
 
@@ -777,11 +917,13 @@ async function runIdeationTurn({
   projectId,
   prompt,
   onOutput,
+  onProcess,
 }: {
   sessionId: string
   projectId: string
   prompt: string
   onOutput: (event: AgentEvent) => void
+  onProcess?: (proc: ChildProcess, logFile: string, backend: RunBackend, sessionId: string | undefined) => void
 }) {
   const projectDir = resolveProjectDir(projectId)
   await checkRequiredTools(basename(projectDir))
@@ -791,17 +933,46 @@ async function runIdeationTurn({
   let backend: ChatBackend
 
   if (existing?.backend === 'claude') {
-    run = await runClaude({ prompt, projectDir, onOutput, session: { id: existing.sessionId, resume: true }, readOnly: true })
     backend = 'claude'
+    run = await runClaude({
+      prompt,
+      projectDir,
+      onOutput,
+      session: { id: existing.sessionId, resume: true },
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else if (existing?.backend === 'opencode') {
-    run = await runOpencode({ prompt, projectDir, onOutput, sessionId: existing.sessionId, readOnly: true })
     backend = 'opencode'
+    run = await runOpencode({
+      prompt,
+      projectDir,
+      onOutput,
+      sessionId: existing.sessionId,
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else if (existing?.backend === 'kilocode') {
-    run = await runKilocode({ prompt, projectDir, onOutput, sessionId: existing.sessionId, readOnly: true })
     backend = 'kilocode'
+    run = await runKilocode({
+      prompt,
+      projectDir,
+      onOutput,
+      sessionId: existing.sessionId,
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+    })
   } else {
-    run = await runClaude({ prompt, projectDir, onOutput, session: { id: randomUUID(), resume: false }, readOnly: true })
     backend = 'claude'
+    const freshId = randomUUID()
+    run = await runClaude({
+      prompt,
+      projectDir,
+      onOutput,
+      session: { id: freshId, resume: false },
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+    })
   }
 
   if (run.needsFallback) {
@@ -819,7 +990,7 @@ async function runIdeationTurn({
 // since they don't share a lock, but the same session can't have two in flight.
 function runIdeation(sessionId: string, projectId: string, buildTurnPrompt: () => Promise<string> | string): boolean {
   if (activeIdeation.has(sessionId)) return false
-  activeIdeation.set(sessionId, { sessionId })
+  activeIdeation.set(sessionId, { sessionId, events: [] })
 
   ;(async () => {
     try {
@@ -829,7 +1000,11 @@ function runIdeation(sessionId: string, projectId: string, buildTurnPrompt: () =
         sessionId,
         projectId,
         prompt,
-        onOutput: (event) => broadcast({ type: 'ideation_output', sessionId, event }),
+        onOutput: (event) => {
+          activeIdeation.get(sessionId)?.events.push(event)
+          broadcast({ type: 'ideation_output', sessionId, event })
+        },
+        onProcess: (proc, logFile, backend, backendSessionId) => registerRun(sessionId, 'ideation', backend, backendSessionId, proc, logFile),
       })
       broadcast({ type: 'ideation_turn_done', sessionId })
     } catch (err: any) {
@@ -837,6 +1012,7 @@ function runIdeation(sessionId: string, projectId: string, buildTurnPrompt: () =
       broadcast({ type: 'error', sessionId, message: err.message })
     } finally {
       activeIdeation.delete(sessionId)
+      clearActiveRun(sessionId)
     }
   })()
 
@@ -887,18 +1063,36 @@ async function runDriverTurn({
   projectId,
   prompt,
   onOutput,
+  onProcess,
 }: {
   sessionId: string
   projectId: string
   prompt: string
   onOutput: (event: AgentEvent) => void
+  onProcess?: (proc: ChildProcess, logFile: string, sessionId: string) => void
 }) {
   const projectDir = resolveProjectDir(projectId)
   await checkRequiredTools(basename(projectDir))
   const existing = getChatSession(sessionId)
+  const freshId = randomUUID()
+  const claudeSessionId = existing?.backend === 'claude' ? existing.sessionId : freshId
   const run = existing?.backend === 'claude'
-    ? await runClaude({ prompt, projectDir, onOutput, session: { id: existing.sessionId, resume: true }, readOnly: true })
-    : await runClaude({ prompt, projectDir, onOutput, session: { id: randomUUID(), resume: false }, readOnly: true })
+    ? await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: existing.sessionId, resume: true },
+        readOnly: true,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
+      })
+    : await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: freshId, resume: false },
+        readOnly: true,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
+      })
 
   if (run.needsFallback) {
     throw new Error('The agent exited without producing any output for this Driver turn — no real response was generated. Check the agent\'s own logs.')
@@ -1314,7 +1508,7 @@ function runAutonomousScan(sessionId: string, projectId: string) {
 // once (by executeDriverActions) for the loop to pick it up either way.
 function runDriver(sessionId: string, projectId: string, buildTurnPrompt: () => Promise<string> | string): boolean {
   if (activeDriver.has(sessionId)) return false
-  activeDriver.set(sessionId, { sessionId })
+  activeDriver.set(sessionId, { sessionId, events: [] })
 
   ;(async () => {
     let assistantText = ''
@@ -1328,8 +1522,10 @@ function runDriver(sessionId: string, projectId: string, buildTurnPrompt: () => 
         prompt,
         onOutput: (event) => {
           if (event.kind === 'text') assistantText += event.text
+          activeDriver.get(sessionId)?.events.push(event)
           broadcast({ type: 'driver_output', sessionId, event })
         },
+        onProcess: (proc, logFile, backendSessionId) => registerRun(sessionId, 'driver', 'claude', backendSessionId, proc, logFile, projectId),
       })
       broadcast({ type: 'driver_turn_done', sessionId })
     } catch (err: any) {
@@ -1338,6 +1534,7 @@ function runDriver(sessionId: string, projectId: string, buildTurnPrompt: () => 
       turnFailed = true
     } finally {
       activeDriver.delete(sessionId)
+      clearActiveRun(sessionId)
     }
     if (turnFailed) return
 
@@ -1425,20 +1622,38 @@ async function runDesignTurn({
   designDir,
   prompt,
   onOutput,
+  onProcess,
 }: {
   sessionId: string
   projectId: string
   designDir: string
   prompt: string
   onOutput: (event: AgentEvent) => void
+  onProcess?: (proc: ChildProcess, logFile: string, sessionId: string) => void
 }) {
   const projectDir = resolveProjectDir(projectId)
   await checkRequiredTools(basename(projectDir))
   mkdirSync(designDir, { recursive: true })
   const existing = getChatSession(sessionId)
+  const freshId = randomUUID()
+  const claudeSessionId = existing?.backend === 'claude' ? existing.sessionId : freshId
   const run = existing?.backend === 'claude'
-    ? await runClaude({ prompt, projectDir, onOutput, session: { id: existing.sessionId, resume: true }, designDir })
-    : await runClaude({ prompt, projectDir, onOutput, session: { id: randomUUID(), resume: false }, designDir })
+    ? await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: existing.sessionId, resume: true },
+        designDir,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
+      })
+    : await runClaude({
+        prompt,
+        projectDir,
+        onOutput,
+        session: { id: freshId, resume: false },
+        designDir,
+        onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
+      })
 
   if (run.needsFallback) {
     throw new Error('The agent exited without producing any output for this design turn — no real response was generated. Check the agent\'s own logs.')
@@ -1450,7 +1665,7 @@ async function runDesignTurn({
 // Mirrors runIdeation()/runDriver(), against the separate activeDesign map.
 function runDesign(sessionId: string, projectId: string, designDir: string, buildTurnPrompt: () => Promise<string> | string): boolean {
   if (activeDesign.has(sessionId)) return false
-  activeDesign.set(sessionId, { sessionId })
+  activeDesign.set(sessionId, { sessionId, events: [] })
 
   ;(async () => {
     try {
@@ -1461,7 +1676,11 @@ function runDesign(sessionId: string, projectId: string, designDir: string, buil
         projectId,
         designDir,
         prompt,
-        onOutput: (event) => broadcast({ type: 'design_output', sessionId, event }),
+        onOutput: (event) => {
+          activeDesign.get(sessionId)?.events.push(event)
+          broadcast({ type: 'design_output', sessionId, event })
+        },
+        onProcess: (proc, logFile, backendSessionId) => registerRun(sessionId, 'design', 'claude', backendSessionId, proc, logFile),
       })
       broadcast({ type: 'design_turn_done', sessionId })
     } catch (err: any) {
@@ -1469,6 +1688,7 @@ function runDesign(sessionId: string, projectId: string, designDir: string, buil
       broadcast({ type: 'error', sessionId, message: err.message })
     } finally {
       activeDesign.delete(sessionId)
+      clearActiveRun(sessionId)
     }
   })()
 
@@ -1685,6 +1905,14 @@ wss.on('connection', (ws: WebSocket) => {
     activeDesignSessionIds: [...activeDesign.keys()],
     driverSessionModes: Object.fromEntries(driverSessionMode),
     driverOwnership: Object.fromEntries([...driverOwnership].map(([sessionId, ids]) => [sessionId, [...ids]])),
+    // Accumulated events for whatever's still active, so a (re)connecting
+    // client can render the true in-progress state immediately instead of
+    // waiting for the next output event — see App.tsx's 'hello' handler.
+    activeTaskEvents: Object.fromEntries([...active].map(([id, s]) => [id, s.events])),
+    activeRefineEvents: Object.fromEntries([...activeRefine].map(([id, e]) => [id, e.events])),
+    activeIdeationEvents: Object.fromEntries([...activeIdeation].map(([id, e]) => [id, e.events])),
+    activeDriverEvents: Object.fromEntries([...activeDriver].map(([id, e]) => [id, e.events])),
+    activeDesignEvents: Object.fromEntries([...activeDesign].map(([id, e]) => [id, e.events])),
   })
   ws.on('message', (data) => {
     try {
@@ -1692,6 +1920,7 @@ wss.on('connection', (ws: WebSocket) => {
       if (msg.type === 'start') handleStart(ws, msg)
       else if (msg.type === 'stop') handleStop(ws, msg)
       else if (msg.type === 'restart') handleRestart(ws, msg)
+      else if (msg.type === 'feedback') handleFeedback(ws, msg)
       else if (msg.type === 'refine_start') handleRefineStart(ws, msg)
       else if (msg.type === 'refine_message') handleRefineMessage(ws, msg)
       else if (msg.type === 'refine_consolidate') handleRefineConsolidate(ws, msg)
@@ -1746,6 +1975,226 @@ setInterval(() => {
     if (projectId) runAutonomousScan(sessionId, projectId)
   }
 }, AUTONOMOUS_IDLE_RESCAN_MS)
+
+// --- Recovery: reattach to agent processes that outlived a prior server
+// instance (crash, node --watch reload, manual restart) instead of leaving
+// them as invisible orphans — see server/run-registry.ts and agent.ts's
+// openRunLog/tailLines for the mechanism this depends on. Only protects runs
+// that started after this feature shipped (their stdout is file-backed); an
+// older orphan predating it has no log file and can't be recovered.
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Shared by every resume* function below: reattaches to whichever backend the
+// registry says was already in flight. No fresh prompt/projectDir is ever
+// built — resume mode skips spawning entirely (see agent.ts) and just tails
+// the existing logFile / watches the existing pid.
+async function resumeChatTurn(record: ActiveRunRecord, onOutput: (event: AgentEvent) => void): Promise<{ exitCode: number | null; needsFallback: boolean; sessionId?: string }> {
+  const resume = { pid: record.pid, logFile: record.logFile }
+  if (record.backend === 'opencode') return runOpencode({ prompt: '', projectDir: '', onOutput, sessionId: record.sessionId, resume })
+  if (record.backend === 'kilocode') return runKilocode({ prompt: '', projectDir: '', onOutput, sessionId: record.sessionId, resume })
+  return runClaude({ prompt: '', projectDir: '', onOutput, session: record.sessionId ? { id: record.sessionId, resume: true } : undefined, resume })
+}
+
+async function resumeTaskRun(record: ActiveRunRecord, onOutput: (event: AgentEvent) => void): Promise<{ exitCode: number | null; needsFallback: boolean; sessionId?: string }> {
+  if (record.backend === 'mock') return runMockAgent({ issueId: record.key, onOutput, resume: { pid: record.pid, logFile: record.logFile } })
+  return resumeChatTurn(record, onOutput)
+}
+
+function resumeTask(record: ActiveRunRecord): void {
+  const state: ActiveState = {
+    issueId: record.key,
+    task: '(recovered run)',
+    events: [],
+    done: false,
+    proc: null,
+    pid: record.pid,
+    stopped: false,
+    pendingRestart: false,
+    lastEventAt: Date.now(),
+  }
+  active.set(record.key, state)
+  broadcast({ type: 'task_started', issueId: record.key, task: state.task })
+
+  ;(async () => {
+    try {
+      const result = await resumeTaskRun(record, (event) => {
+        state.events.push(event)
+        state.lastEventAt = Date.now()
+        broadcast({ type: 'output', issueId: record.key, event })
+      })
+      if (result.needsFallback) {
+        throw new Error('Recovered run never finished — it either produced no further output or the process exited without completing before this server restarted.')
+      }
+      state.done = true
+      if (state.stopped) {
+        if (!state.pendingRestart) broadcast({ type: 'stopped', issueId: record.key })
+      } else {
+        broadcast({ type: 'done', issueId: record.key, exitCode: result.exitCode })
+      }
+    } catch (err: any) {
+      state.done = true
+      console.error(`[task ${record.key}] recovered run failed:`, err)
+      broadcast({ type: 'error', issueId: record.key, message: err.message })
+    } finally {
+      active.delete(record.key)
+      clearActiveRun(record.key)
+      if (state.pendingRestart) startRun(record.key, state.task)
+    }
+  })()
+}
+
+function resumeRefine(record: ActiveRunRecord): void {
+  activeRefine.set(record.key, { issueId: record.key, lastEventAt: Date.now(), textParts: [], events: [] })
+  broadcast({ type: 'refine_turn_started', issueId: record.key })
+
+  ;(async () => {
+    try {
+      const result = await resumeChatTurn(record, (event) => {
+        const entry = activeRefine.get(record.key)
+        if (entry) {
+          entry.lastEventAt = Date.now()
+          entry.events.push(event)
+          if (event.kind === 'text') entry.textParts.push(event.text)
+        }
+        broadcast({ type: 'refine_output', issueId: record.key, event })
+      })
+      if (result.needsFallback) throw new Error('Recovered refine turn never finished before this server restarted.')
+      const summary = (activeRefine.get(record.key)?.textParts.join('') ?? '').trim()
+      const trimmedSummary = summary.length > 4000 ? `${summary.slice(0, 4000)}\n… (truncated)` : summary
+      broadcast({ type: 'refine_turn_done', issueId: record.key, summary: trimmedSummary })
+    } catch (err: any) {
+      console.error(`[refine ${record.key}] recovered run failed:`, err)
+      broadcast({ type: 'error', issueId: record.key, message: err.message })
+    } finally {
+      activeRefine.delete(record.key)
+      clearActiveRun(record.key)
+    }
+  })()
+}
+
+function resumeIdeation(record: ActiveRunRecord): void {
+  activeIdeation.set(record.key, { sessionId: record.key, events: [] })
+  broadcast({ type: 'ideation_turn_started', sessionId: record.key })
+
+  ;(async () => {
+    try {
+      const result = await resumeChatTurn(record, (event) => {
+        activeIdeation.get(record.key)?.events.push(event)
+        broadcast({ type: 'ideation_output', sessionId: record.key, event })
+      })
+      if (result.needsFallback) throw new Error('Recovered ideation turn never finished before this server restarted.')
+      broadcast({ type: 'ideation_turn_done', sessionId: record.key })
+    } catch (err: any) {
+      console.error(`[ideation ${record.key}] recovered run failed:`, err)
+      broadcast({ type: 'error', sessionId: record.key, message: err.message })
+    } finally {
+      activeIdeation.delete(record.key)
+      clearActiveRun(record.key)
+    }
+  })()
+}
+
+function resumeDesign(record: ActiveRunRecord): void {
+  activeDesign.set(record.key, { sessionId: record.key, events: [] })
+  broadcast({ type: 'design_turn_started', sessionId: record.key })
+
+  ;(async () => {
+    try {
+      const result = await resumeChatTurn(record, (event) => {
+        activeDesign.get(record.key)?.events.push(event)
+        broadcast({ type: 'design_output', sessionId: record.key, event })
+      })
+      if (result.needsFallback) throw new Error('Recovered design turn never finished before this server restarted.')
+      broadcast({ type: 'design_turn_done', sessionId: record.key })
+    } catch (err: any) {
+      console.error(`[design ${record.key}] recovered run failed:`, err)
+      broadcast({ type: 'error', sessionId: record.key, message: err.message })
+    } finally {
+      activeDesign.delete(record.key)
+      clearActiveRun(record.key)
+    }
+  })()
+}
+
+// Mirrors runDriver()'s full tail — a recovered Driver turn still needs to
+// parse and execute whatever action block it proposed, same as a live one,
+// otherwise a run that only finishes after recovery would silently drop it.
+function resumeDriver(record: ActiveRunRecord): void {
+  if (!record.projectId) {
+    console.error(`[em ${record.key}] recovered run has no projectId in the registry, cannot execute any proposed action — skipping`)
+    clearActiveRun(record.key)
+    return
+  }
+  const projectId = record.projectId
+  activeDriver.set(record.key, { sessionId: record.key, events: [] })
+  broadcast({ type: 'driver_turn_started', sessionId: record.key })
+  let assistantText = ''
+
+  ;(async () => {
+    let turnFailed = false
+    try {
+      const result = await resumeChatTurn(record, (event) => {
+        if (event.kind === 'text') assistantText += event.text
+        activeDriver.get(record.key)?.events.push(event)
+        broadcast({ type: 'driver_output', sessionId: record.key, event })
+      })
+      if (result.needsFallback) throw new Error('Recovered Driver turn never finished before this server restarted.')
+      broadcast({ type: 'driver_turn_done', sessionId: record.key })
+    } catch (err: any) {
+      console.error(`[em ${record.key}] recovered run failed:`, err)
+      broadcast({ type: 'error', sessionId: record.key, message: err.message })
+      turnFailed = true
+    } finally {
+      activeDriver.delete(record.key)
+      clearActiveRun(record.key)
+    }
+    if (turnFailed) return
+
+    const actions = parseDriverActions(assistantText)
+    await executeDriverActions(record.key, projectId, actions)
+
+    if (pendingDriverEvents.get(record.key)?.length) {
+      const timer = driverDebounceTimer.get(record.key)
+      if (timer) {
+        clearTimeout(timer)
+        driverDebounceTimer.delete(record.key)
+      }
+      flushDriverEvents(record.key)
+    }
+  })()
+}
+
+function recoverActiveRuns(): void {
+  for (const record of loadActiveRuns()) {
+    if (!isPidAlive(record.pid)) {
+      clearActiveRun(record.key)
+      appendFriction({
+        kind: 'run_failed',
+        timestamp: new Date().toISOString(),
+        issueId: record.kind === 'task' || record.kind === 'refine' ? record.key : undefined,
+        sessionId: record.kind === 'task' || record.kind === 'refine' ? undefined : record.key,
+        detail: `A ${record.kind} run was interrupted by a server restart and its process had already exited before recovery could reattach — outcome unknown.`,
+      })
+      continue
+    }
+    console.log(`[recover] reattaching to ${record.kind} run ${record.key} (pid ${record.pid})`)
+    if (record.kind === 'task') resumeTask(record)
+    else if (record.kind === 'refine') resumeRefine(record)
+    else if (record.kind === 'ideation') resumeIdeation(record)
+    else if (record.kind === 'driver') resumeDriver(record)
+    else if (record.kind === 'design') resumeDesign(record)
+  }
+}
+
+recoverActiveRuns()
 
 // Bound explicitly to 127.0.0.1 — this port carries the unauthenticated
 // /api/linear/* routes and the WebSocket control plane (which can spawn real
