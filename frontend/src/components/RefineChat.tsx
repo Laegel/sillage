@@ -1,3 +1,4 @@
+import React from 'react'
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -9,6 +10,7 @@ import {
 } from '@assistant-ui/react'
 import type { AgentEvent, ChatMessage } from '../types.ts'
 import { OrchestratorNote, Separator, StatusLine, TextBlock, ToolCallCard } from './AgentEventView.tsx'
+import { stripPlanBlock } from '../lib/refineExtract.ts'
 
 // content can be a plain string OR an array of typed parts — this pulls out
 // just the array-of-parts member so mapping AgentEvent -> part stays typed.
@@ -143,8 +145,17 @@ export default function RefineChat({
   onConsolidate: () => void
   onApply: (planText: string) => void
 }) {
+  const cleanedMessages = React.useMemo(
+    () =>
+      messages.map((m) => ({
+        ...m,
+        events: m.events.map((e) => (e.kind === 'text' ? { ...e, text: stripPlanBlock(e.text) } : e)),
+      })),
+    [messages],
+  )
+
   const runtime = useExternalStoreRuntime({
-    messages,
+    messages: cleanedMessages,
     isRunning: running,
     convertMessage,
     onNew: async (message: AppendMessage) => {

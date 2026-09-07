@@ -1,6 +1,8 @@
 import React from 'react'
-import type { IdeationCandidate, IdeationSession, Project } from '../types.ts'
+import type { IdeationCandidate, IdeationSession, Project, SynthesisEntry } from '../types.ts'
+import { fetchSynthesis, generateSynthesis } from '../api.ts'
 import IdeationChat from './IdeationChat.tsx'
+import Markdown from './Markdown.tsx'
 
 // Mirrors DesignView's isBlocked — a session is "blocked" iff its last
 // message is the assistant's and its most recent status event still needs
@@ -49,10 +51,36 @@ export default function IdeationView({
   onDelete: (sessionId: string) => void
 }) {
   const [newProjectId, setNewProjectId] = React.useState('')
+  const [synthesis, setSynthesis] = React.useState<SynthesisEntry | null>(null)
+  const [synthesisLoading, setSynthesisLoading] = React.useState(false)
+  const [generating, setGenerating] = React.useState(false)
 
   React.useEffect(() => {
     if (!newProjectId && projects.length > 0) setNewProjectId(projects[0].id)
   }, [projects, newProjectId])
+
+  React.useEffect(() => {
+    if (!newProjectId) {
+      setSynthesis(null)
+      return
+    }
+    setSynthesisLoading(true)
+    fetchSynthesis(newProjectId)
+      .then((data) => setSynthesis(data.synthesis))
+      .catch(() => setSynthesis(null))
+      .finally(() => setSynthesisLoading(false))
+  }, [newProjectId])
+
+  const handleGenerateSynthesis = async () => {
+    if (!newProjectId) return
+    setGenerating(true)
+    try {
+      const data = await generateSynthesis(newProjectId)
+      setSynthesis(data.synthesis)
+    } finally {
+      setGenerating(false)
+    }
+  }
 
   const sorted = Object.values(sessions).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
   const selected = selectedId ? sessions[selectedId] : null
@@ -83,6 +111,23 @@ export default function IdeationView({
           + New idea
         </button>
       </div>
+
+      {newProjectId && (
+        <details className="synthesis-panel">
+          <summary className="synthesis-panel-header">
+            <span className="synthesis-panel-title">Project synthesis</span>
+            <span className="synthesis-panel-updated">
+              {synthesisLoading ? 'loading…' : synthesis ? formatRelativeTime(synthesis.updatedAt) : 'none yet'}
+            </span>
+          </summary>
+          <div className="synthesis-panel-body">
+            {synthesis ? <Markdown>{synthesis.text}</Markdown> : <p className="hint">No synthesis yet for this project.</p>}
+            <button type="button" onClick={handleGenerateSynthesis} disabled={!connected || generating}>
+              {generating ? 'Generating…' : synthesis ? 'Regenerate' : 'Generate'}
+            </button>
+          </div>
+        </details>
+      )}
 
       <div className="ideation-strip">
         {sorted.map((s) => (

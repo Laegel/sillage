@@ -12,6 +12,7 @@ import UsageView from './components/UsageView.tsx'
 import Toasts from './components/Toasts.tsx'
 import type { ChatMessage, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, StreamEntry, ToastMessage, WsMessage } from './types.ts'
 import { appendEvent, eventsToPlainText } from './lib/agentEvents.ts'
+import { parsePlan } from './lib/refineExtract.ts'
 import { loadRefineHistory, saveRefineHistory, toRefineHistoryStore } from './lib/refineHistory.ts'
 import { loadIdeationSessions, saveIdeationSessions } from './lib/ideationHistory.ts'
 import { loadDriverSessions, saveDriverSessions } from './lib/driverHistory.ts'
@@ -504,11 +505,14 @@ export default function App() {
             next.delete(issueId)
             return next
           })
+          const list = refineChatsRef.current[issueId]
+          const lastEvents = list && list.length > 0 ? list[list.length - 1].events : undefined
           if (pendingConsolidateRef.current.has(issueId)) {
             pendingConsolidateRef.current.delete(issueId)
-            const list = refineChatsRef.current[issueId]
-            const planText = list && list.length > 0 ? eventsToPlainText(list[list.length - 1].events) : ''
-            setDraftPlans((prev) => ({ ...prev, [issueId]: planText }))
+            setDraftPlans((prev) => ({ ...prev, [issueId]: lastEvents ? eventsToPlainText(lastEvents) : '' }))
+          } else if (lastEvents) {
+            const planText = parsePlan(lastEvents)
+            if (planText) setDraftPlans((prev) => ({ ...prev, [issueId]: planText }))
           }
           break
         }

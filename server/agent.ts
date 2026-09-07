@@ -64,8 +64,15 @@ function tailLines(logFile: string, onLine: (line: string) => void, pollMs = 300
   tick()
   const timer = setInterval(tick, pollMs)
   return () => {
-    stopped = true
     clearInterval(timer)
+    // A process can write its last output and exit within the same poll
+    // window — confirmed live: a real, complete response landed in the log
+    // file but was never read, because the exit handler stopped tailing
+    // before the next tick, and got reported upstream as "no output"
+    // (wrongly triggering a backend fallback or a hard failure). One last
+    // synchronous read here closes that gap.
+    tick()
+    stopped = true
   }
 }
 
@@ -161,7 +168,12 @@ RULES FOR THIS DISCUSSION
 3. Present 2-4 concrete options or a clear feasibility assessment with trade-offs, grounded in what you actually found in the codebase (cite real file paths).
 4. If something is genuinely ambiguous or needs a decision only the user can make, ask a specific question instead of guessing.
 5. Keep it conversational and concise — this is a live back-and-forth discussion, not a report.
-6. If you want to persist a plan or decision for this issue, do NOT write a markdown file — use \`curl -X POST http://127.0.0.1:4390/api/plans -H "Content-Type: application/json" -d '{"title":"...","content":"...","issueId":"${issue.id}"}'\` instead. The orchestrator stores it server-side and surfaces it in the UI.`
+6. If you want to persist a plan or decision for this issue, do NOT write a markdown file — use \`curl -X POST http://127.0.0.1:4390/api/plans -H "Content-Type: application/json" -d '{"title":"...","content":"...","issueId":"${issue.id}"}'\` instead. The orchestrator stores it server-side and surfaces it in the UI.
+7. If — and only if — this reply is a complete, ready plan (no more clarifying questions, nothing you'd change if the user clicked "Consolidate" right now), end it with a fenced \`\`\`plan code block written to this exact standard:
+
+${CONSOLIDATE_PROMPT}
+
+If you still have a question or the plan needs more discussion, do NOT include a \`\`\`plan block — just reply normally.`
 }
 
 // Sent as a same-session follow-up turn once the user clicks "Consolidate". The
