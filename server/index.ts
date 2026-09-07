@@ -1617,6 +1617,15 @@ const server = http.createServer(async (req, res) => {
       const filePath = join(resolveDesignDir(projectId, sessionId, issueId), 'index.html')
       return json(res, 200, { html: existsSync(filePath) ? readFileSync(filePath, 'utf8') : null })
     }
+    const designControlsMatch = path.match(/^\/api\/design\/([^/]+)\/controls$/)
+    if (designControlsMatch && req.method === 'GET') {
+      const [, sessionId] = designControlsMatch
+      const projectId = url.searchParams.get('projectId') || ''
+      const issueId = url.searchParams.get('issueId') || undefined
+      if (!projectId) return json(res, 400, { error: 'projectId is required' })
+      const filePath = join(resolveDesignDir(projectId, sessionId, issueId), 'controls.html')
+      return json(res, 200, { html: existsSync(filePath) ? readFileSync(filePath, 'utf8') : null })
+    }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {
       const [, planId, apply] = plansMatch

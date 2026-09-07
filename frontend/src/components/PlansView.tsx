@@ -1,5 +1,6 @@
 import React from 'react'
-import { updateIssue, applyPlan, type Plan } from '../api.ts'
+import { updateIssue, applyPlan } from '../api.ts'
+import type { Plan } from '../types.ts'
 
 export default function PlansView({ plans, onApply, disabled }: { plans: Plan[]; onApply?: () => void; disabled?: boolean }) {
   const [applying, setApplying] = React.useState<string | null>(null)
