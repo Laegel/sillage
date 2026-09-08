@@ -9,14 +9,16 @@ export default function DriverChat({
   messages,
   running,
   onSend,
+  draftKey,
 }: {
   messages: ChatMessage[]
   running: boolean
   onSend: (message: string, images?: string[]) => void
+  draftKey?: string
 }) {
   return (
     <div className="driver-chat">
-      <ChatThread messages={messages} running={running} onSend={onSend} enableAttachments composerPlaceholder="Talk to the driver…" />
+      <ChatThread messages={messages} running={running} onSend={onSend} enableAttachments composerPlaceholder="Talk to the driver…" draftKey={draftKey} />
     </div>
   )
 }

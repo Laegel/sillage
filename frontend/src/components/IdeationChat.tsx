@@ -67,6 +67,7 @@ export default function IdeationChat({
   running,
   onSend,
   onCreateCandidate,
+  draftKey,
 }: {
   sessionId: string
   projectId: string
@@ -74,6 +75,7 @@ export default function IdeationChat({
   running: boolean
   onSend: (message: string, images?: string[]) => void
   onCreateCandidate: (sessionId: string, candidate: IdeationCandidate, projectId: string) => Promise<void>
+  draftKey?: string
 }) {
   // Candidates are derived per-message and injected as a synthetic
   // ideation_candidates event into that specific message's own event list —
@@ -100,6 +102,7 @@ export default function IdeationChat({
         onSend={onSend}
         enableAttachments
         composerPlaceholder="What's on your mind?"
+        draftKey={draftKey}
         dataRenderers={{
           ideation_candidates: ({ data }) => (
             <IdeationCandidatesRenderer
