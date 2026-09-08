@@ -164,6 +164,7 @@ export default function IdeationView({
           running={running.has(selected.id)}
           onSend={(message, images) => onSend(selected.id, message, images)}
           onCreateCandidate={onCreateCandidate}
+          draftKey={selected.id}
         />
       ) : (
         <p className="hint">Pick a discussion, or start a new one.</p>

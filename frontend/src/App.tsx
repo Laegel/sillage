@@ -16,6 +16,7 @@ import { loadRefineHistory, saveRefineHistory, toRefineHistoryStore } from './li
 import { loadIdeationSessions, saveIdeationSessions } from './lib/ideationHistory.ts'
 import { loadDriverSessions, saveDriverSessions } from './lib/driverHistory.ts'
 import { loadDesignSessions, saveDesignSessions } from './lib/designHistory.ts'
+import { DraftStoreProvider } from './lib/draftStore.tsx'
 
 let toastSeq = 0
 
@@ -962,7 +963,8 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <DraftStoreProvider>
+      <div className="app">
       <header className="app-header">
         <h1>
           <img src="/favicon.png" alt="Sillage" className="app-logo" />
@@ -1089,6 +1091,7 @@ export default function App() {
         />
       )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
-    </div>
+      </div>
+    </DraftStoreProvider>
   )
 }

@@ -162,6 +162,7 @@ export default function TaskPanel({
             messages={refineChat}
             running={refineRunning}
             draftPlan={draftPlan}
+            draftKey={issue.id}
             onSend={(message) => onRefineMessage(issue.id, message)}
             onConsolidate={() => onConsolidate(issue.id)}
             onApply={(planText) => onApplyPlan(issue.id, planText)}

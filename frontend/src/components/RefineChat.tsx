@@ -9,6 +9,7 @@ import {
 } from '@assistant-ui/react'
 import type { AgentEvent, ChatMessage } from '../types.ts'
 import { OrchestratorNote, Separator, StatusLine, TextBlock, ToolCallCard } from './AgentEventView.tsx'
+import { DraftComposerSync } from '../lib/draftStore.tsx'
 
 // content can be a plain string OR an array of typed parts — this pulls out
 // just the array-of-parts member so mapping AgentEvent -> part stays typed.
@@ -135,6 +136,7 @@ export default function RefineChat({
   onSend,
   onConsolidate,
   onApply,
+  draftKey,
 }: {
   messages: ChatMessage[]
   running: boolean
@@ -142,6 +144,10 @@ export default function RefineChat({
   onSend: (message: string) => void
   onConsolidate: () => void
   onApply: (planText: string) => void
+  // Key into the App-level draft store (the Board issue id). Present only to
+  // preserve in-progress composer text across task-panel remounts — see
+  // lib/draftStore.tsx.
+  draftKey?: string
 }) {
   const runtime = useExternalStoreRuntime({
     messages,
@@ -159,6 +165,7 @@ export default function RefineChat({
   return (
     <div className="refine-chat">
       <AssistantRuntimeProvider runtime={runtime}>
+        <DraftComposerSync draftKey={draftKey} />
         <ThreadPrimitive.Root className="chat-thread">
           <ThreadPrimitive.Viewport className="chat-messages">
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />

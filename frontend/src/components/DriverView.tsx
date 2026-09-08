@@ -134,6 +134,7 @@ export default function DriverView({
             messages={selected.messages}
             running={running.has(selected.id)}
             onSend={(message, images) => onSend(selected.id, message, images)}
+            draftKey={selected.id}
           />
         </>
       ) : (

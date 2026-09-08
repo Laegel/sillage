@@ -15,6 +15,7 @@ type ChatPanelParams = {
   running: boolean
   issueId?: string
   committing: boolean
+  draftKey: string
   onSend: (message: string, images?: string[]) => void
   onCommit: () => void
 }
@@ -162,6 +163,7 @@ export default function DesignView({
         running: running.has(selected.id),
         issueId: selected.issueId,
         committing: committing.has(selected.id),
+        draftKey: selected.id,
         onSend: (message, images) => onSend(selected.id, message, images),
         onCommit: () => onCommit(selected.id),
       }

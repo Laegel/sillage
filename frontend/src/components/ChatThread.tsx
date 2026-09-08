@@ -17,6 +17,7 @@ import { createPortal } from 'react-dom'
 import type { AgentEvent, ChatMessage } from '../types.ts'
 import { LoadingDots, OrchestratorNote, Separator, StatusLine, ToolCallCard, UsageLine } from './AgentEventView.tsx'
 import Markdown from './Markdown.tsx'
+import { DraftComposerSync } from '../lib/draftStore.tsx'
 
 // content can be a plain string OR an array of typed parts — this pulls out
 // just the array-of-parts member so mapping AgentEvent -> part stays typed.
@@ -212,6 +213,7 @@ export default function ChatThread({
   enableAttachments = false,
   showAttachButton = true,
   dataRenderers,
+  draftKey,
 }: {
   messages: ChatMessage[]
   running: boolean
@@ -226,6 +228,10 @@ export default function ChatThread({
   // specific message that proposed them (see agentEventToPart above) instead of
   // needing this shared component to know anything Ideation-specific.
   dataRenderers?: Record<string, DataMessagePartComponent | undefined>
+  // Key into the App-level draft store (session id for Ideation/Driver/Design).
+  // Present only when callers want in-progress composer text preserved across
+  // remounts — see lib/draftStore.tsx.
+  draftKey?: string
 }) {
   const messageComponents = React.useMemo(
     () => ({
@@ -277,6 +283,7 @@ export default function ChatThread({
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <MessageComponentsContext.Provider value={messageComponents}>
+        <DraftComposerSync draftKey={draftKey} />
         <ThreadPrimitive.Root className="chat-thread">
           <ThreadPrimitive.Viewport className="chat-messages">
             <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />

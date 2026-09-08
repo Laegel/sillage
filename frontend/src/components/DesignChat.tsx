@@ -8,6 +8,7 @@ export default function DesignChat({
   committing,
   onSend,
   onCommit,
+  draftKey,
 }: {
   messages: ChatMessage[]
   running: boolean
@@ -15,6 +16,7 @@ export default function DesignChat({
   committing: boolean
   onSend: (message: string, images?: string[]) => void
   onCommit: () => void
+  draftKey?: string
 }) {
   return (
     <div className="design-chat">
@@ -24,6 +26,7 @@ export default function DesignChat({
         onSend={onSend}
         enableAttachments
         composerPlaceholder="Describe the screen…"
+        draftKey={draftKey}
         actions={
           <button
             type="button"
