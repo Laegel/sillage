@@ -840,6 +840,7 @@ function runRefine(
   issueId: string,
   buildTurnPrompt: () => Promise<string> | string,
   onDone?: (result: { ok: boolean; message: string }) => void,
+  isConsolidation = false,
 ): boolean {
   if (activeRefine.has(issueId)) return false
   activeRefine.set(issueId, { issueId, lastEventAt: Date.now(), textParts: [], events: [] })
@@ -871,15 +872,19 @@ function runRefine(
       // silence to anything that isn't a live WS client.
       const summary = (activeRefine.get(issueId)?.textParts.join('') ?? '').trim()
       const trimmedSummary = summary.length > 4000 ? `${summary.slice(0, 4000)}\n… (truncated)` : summary
-      broadcast({ type: 'refine_turn_done', issueId, summary: trimmedSummary })
+      // isConsolidation travels ON this same message rather than as a separate
+      // earlier broadcast — a client that wasn't connected at the exact moment
+      // of an earlier signal would permanently miss it (confirmed live: the
+      // agent's curl call and the auto-fired consolidate turn both genuinely
+      // succeeded server-side, but the browser still showed no draft-plan box
+      // because it missed the one-time "about to consolidate" message). Any
+      // client connected by the time THIS message arrives gets the full fact.
+      broadcast({ type: 'refine_turn_done', issueId, summary: trimmedSummary, isConsolidation })
       if (refineReadyToConsolidate.delete(issueId)) {
-        // Mirrors the manual "Consolidate" button click: tell clients to treat
-        // the NEXT refine_turn_done for this issue as the consolidation result,
-        // then fire that turn. Deferred past this run's own `finally` (which
-        // hasn't executed yet — we're still inside its `try` block) so the
-        // busy-check in runRefine doesn't reject it as already-active.
-        broadcast({ type: 'refine_ready_to_consolidate', issueId })
-        queueMicrotask(() => runRefine(issueId, () => CONSOLIDATE_PROMPT))
+        // Deferred past this run's own `finally` (which hasn't executed yet —
+        // we're still inside its `try` block) so the busy-check in runRefine
+        // doesn't reject it as already-active.
+        queueMicrotask(() => runRefine(issueId, () => CONSOLIDATE_PROMPT, undefined, true))
       }
       onDone?.({ ok: true, message: trimmedSummary || 'refine turn complete (no text output)' })
     } catch (err: any) {
@@ -919,7 +924,7 @@ function handleRefineMessage(ws: WebSocket, payload: any) {
 function handleRefineConsolidate(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   if (!issueId) return send(ws, { type: 'error', message: 'issueId is required' })
-  const started = runRefine(issueId, () => CONSOLIDATE_PROMPT)
+  const started = runRefine(issueId, () => CONSOLIDATE_PROMPT, undefined, true)
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
 

@@ -61,7 +61,6 @@ export default function App() {
         .map(([id, h]) => [id, h.draftPlan]),
     ),
   )
-  const pendingConsolidateRef = React.useRef<Set<string>>(new Set())
   // Ideation sessions are entirely client-owned (see lib/ideationHistory.ts),
   // same split as refine transcripts — the server only ever persists
   // {backend, sessionId} for continuity, never the title/messages/candidates.
@@ -436,7 +435,6 @@ export default function App() {
               prev.map((s) => (s.issueId === issueId ? { ...s, done: true, errored: true } : s)),
             )
             if (refineRunningRef.current.has(issueId)) {
-              pendingConsolidateRef.current.delete(issueId)
               setRefineRunning((prev) => {
                 const next = new Set(prev)
                 next.delete(issueId)
@@ -504,22 +502,19 @@ export default function App() {
             next.delete(issueId)
             return next
           })
-          if (pendingConsolidateRef.current.has(issueId)) {
-            pendingConsolidateRef.current.delete(issueId)
+          // isConsolidation is carried on this same message (set server-side,
+          // both for a manual "Consolidate" click and for the refine agent's
+          // own POST /api/refine/:issueId/ready — see buildRefineReadyRule in
+          // agent.ts) rather than tracked via a separate signal sent earlier:
+          // any client connected by the time this specific message arrives has
+          // everything it needs, with no earlier broadcast to have missed.
+          if (msg.isConsolidation) {
             const list = refineChatsRef.current[issueId]
             const lastEvents = list && list.length > 0 ? list[list.length - 1].events : undefined
             setDraftPlans((prev) => ({ ...prev, [issueId]: lastEvents ? eventsToPlainText(lastEvents) : '' }))
           }
           break
         }
-        // The refine agent calls POST /api/refine/:issueId/ready when it judges
-        // its own last reply a complete plan (see PLAN_FENCE_RULE in agent.ts).
-        // The server then auto-fires the same consolidate turn the "Consolidate"
-        // button would — this just arms the same pendingConsolidateRef flag that
-        // button click uses, so the turn's result lands in draftPlans identically.
-        case 'refine_ready_to_consolidate':
-          pendingConsolidateRef.current.add(msg.issueId)
-          break
         case 'ideation_turn_started':
           setIdeationSessions((prev) => {
             const session = prev[msg.sessionId]
@@ -758,7 +753,6 @@ export default function App() {
   }
 
   const handleConsolidate = (issueId: string) => {
-    pendingConsolidateRef.current.add(issueId)
     send({ type: 'refine_consolidate', issueId })
   }
 

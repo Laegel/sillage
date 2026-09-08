@@ -200,8 +200,7 @@ export type WsMessage =
   // `summary` is the turn's accumulated text output, plain (not markdown-rendered)
   // and truncated server-side — it exists for the Driver's ownership status-update
   // prompt, not for the UI, which already has the full transcript via refine_output.
-  | { type: 'refine_turn_done'; issueId: string; summary?: string }
-  | { type: 'refine_ready_to_consolidate'; issueId: string }
+  | { type: 'refine_turn_done'; issueId: string; summary?: string; isConsolidation?: boolean }
   | { type: 'ideation_turn_started'; sessionId: string }
   | { type: 'ideation_output'; sessionId: string; event: AgentEvent }
   | { type: 'ideation_turn_done'; sessionId: string }
