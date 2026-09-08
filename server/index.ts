@@ -17,6 +17,7 @@ import {
   buildDesignPrompt,
   buildFullSynthesisPrompt,
   buildIncrementalSynthesisPrompt,
+  buildRefineReadyRule,
   CONSOLIDATE_PROMPT,
   RESUME_RECAP_PROMPT,
   runClaude,
@@ -59,6 +60,12 @@ type ActiveState = {
 const clients = new Set<WebSocket>()
 const active = new Map<string, ActiveState>()
 const activeRefine = new Map<string, { issueId: string; lastEventAt: number; textParts: string[]; events: AgentEvent[] }>()
+// Set by the refine agent itself via POST /api/refine/:issueId/ready when it
+// judges its own just-finished reply to be a complete plan — a tool call the
+// model reliably makes, unlike the fenced-block-in-prose convention this
+// replaced (models kept "finishing" a plan without remembering to also format
+// it a specific way inline). Consumed once, in runRefine's completion branch.
+const refineReadyToConsolidate = new Set<string>()
 const activeIdeation = new Map<string, { sessionId: string; events: AgentEvent[] }>()
 const activeDriver = new Map<string, { sessionId: string; events: AgentEvent[] }>()
 const activeDesign = new Map<string, { sessionId: string; events: AgentEvent[] }>()
@@ -865,6 +872,15 @@ function runRefine(
       const summary = (activeRefine.get(issueId)?.textParts.join('') ?? '').trim()
       const trimmedSummary = summary.length > 4000 ? `${summary.slice(0, 4000)}\n… (truncated)` : summary
       broadcast({ type: 'refine_turn_done', issueId, summary: trimmedSummary })
+      if (refineReadyToConsolidate.delete(issueId)) {
+        // Mirrors the manual "Consolidate" button click: tell clients to treat
+        // the NEXT refine_turn_done for this issue as the consolidation result,
+        // then fire that turn. Deferred past this run's own `finally` (which
+        // hasn't executed yet — we're still inside its `try` block) so the
+        // busy-check in runRefine doesn't reject it as already-active.
+        broadcast({ type: 'refine_ready_to_consolidate', issueId })
+        queueMicrotask(() => runRefine(issueId, () => CONSOLIDATE_PROMPT))
+      }
       onDone?.({ ok: true, message: trimmedSummary || 'refine turn complete (no text output)' })
     } catch (err: any) {
       console.error(`[refine ${issueId}] failed:`, err)
@@ -896,7 +912,7 @@ function handleRefineMessage(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   const message = payload.message
   if (!issueId || !message) return send(ws, { type: 'error', message: 'issueId and message are required' })
-  const started = runRefine(issueId, () => message)
+  const started = runRefine(issueId, () => `${message}\n\n${buildRefineReadyRule(issueId)}`)
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
 
@@ -1845,6 +1861,12 @@ const server = http.createServer(async (req, res) => {
       if (!projectId) return json(res, 400, { error: 'projectId is required' })
       const filePath = join(resolveDesignDir(projectId, sessionId, issueId), 'controls.html')
       return json(res, 200, { html: existsSync(filePath) ? readFileSync(filePath, 'utf8') : null })
+    }
+    const refineReadyMatch = path.match(/^\/api\/refine\/([^/]+)\/ready$/)
+    if (refineReadyMatch && req.method === 'POST') {
+      const [, issueId] = refineReadyMatch
+      refineReadyToConsolidate.add(issueId)
+      return json(res, 200, { ok: true })
     }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {

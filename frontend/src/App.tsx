@@ -12,7 +12,6 @@ import UsageView from './components/UsageView.tsx'
 import Toasts from './components/Toasts.tsx'
 import type { ChatMessage, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, StreamEntry, ToastMessage, WsMessage } from './types.ts'
 import { appendEvent, eventsToPlainText } from './lib/agentEvents.ts'
-import { parsePlan } from './lib/refineExtract.ts'
 import { loadRefineHistory, saveRefineHistory, toRefineHistoryStore } from './lib/refineHistory.ts'
 import { loadIdeationSessions, saveIdeationSessions } from './lib/ideationHistory.ts'
 import { loadDriverSessions, saveDriverSessions } from './lib/driverHistory.ts'
@@ -505,17 +504,22 @@ export default function App() {
             next.delete(issueId)
             return next
           })
-          const list = refineChatsRef.current[issueId]
-          const lastEvents = list && list.length > 0 ? list[list.length - 1].events : undefined
           if (pendingConsolidateRef.current.has(issueId)) {
             pendingConsolidateRef.current.delete(issueId)
+            const list = refineChatsRef.current[issueId]
+            const lastEvents = list && list.length > 0 ? list[list.length - 1].events : undefined
             setDraftPlans((prev) => ({ ...prev, [issueId]: lastEvents ? eventsToPlainText(lastEvents) : '' }))
-          } else if (lastEvents) {
-            const planText = parsePlan(lastEvents)
-            if (planText) setDraftPlans((prev) => ({ ...prev, [issueId]: planText }))
           }
           break
         }
+        // The refine agent calls POST /api/refine/:issueId/ready when it judges
+        // its own last reply a complete plan (see PLAN_FENCE_RULE in agent.ts).
+        // The server then auto-fires the same consolidate turn the "Consolidate"
+        // button would — this just arms the same pendingConsolidateRef flag that
+        // button click uses, so the turn's result lands in draftPlans identically.
+        case 'refine_ready_to_consolidate':
+          pendingConsolidateRef.current.add(msg.issueId)
+          break
         case 'ideation_turn_started':
           setIdeationSessions((prev) => {
             const session = prev[msg.sessionId]

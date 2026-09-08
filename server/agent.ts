@@ -169,11 +169,7 @@ RULES FOR THIS DISCUSSION
 4. If something is genuinely ambiguous or needs a decision only the user can make, ask a specific question instead of guessing.
 5. Keep it conversational and concise — this is a live back-and-forth discussion, not a report.
 6. If you want to persist a plan or decision for this issue, do NOT write a markdown file — use \`curl -X POST http://127.0.0.1:4390/api/plans -H "Content-Type: application/json" -d '{"title":"...","content":"...","issueId":"${issue.id}"}'\` instead. The orchestrator stores it server-side and surfaces it in the UI.
-7. If — and only if — this reply is a complete, ready plan (no more clarifying questions, nothing you'd change if the user clicked "Consolidate" right now), end it with a fenced \`\`\`plan code block written to this exact standard:
-
-${CONSOLIDATE_PROMPT}
-
-If you still have a question or the plan needs more discussion, do NOT include a \`\`\`plan block — just reply normally.`
+7. ${buildRefineReadyRule(issue.id)}`
 }
 
 // Sent as a same-session follow-up turn once the user clicks "Consolidate". The
@@ -184,6 +180,18 @@ If you still have a question or the plan needs more discussion, do NOT include a
 export const CONSOLIDATE_PROMPT = `Based on our discussion so far, write a final, self-contained issue description that captures the agreed plan: the concrete goal, the approach, and any important constraints or decisions we made. Do not include meta-commentary about the discussion itself (no "we discussed" or "the user asked") — write it as the issue description should read on its own, ready for implementation. Do not write any code and do not touch git, GitHub, or Linear.
 
 If, while exploring, you identified specific existing symbols (functions, types, classes) that the implementation will need to read, extend, or reuse, add a "## Relevant symbols" section listing only the ones that actually matter (not everything you looked at), one per line, as: symbolName (path/to/file.ts) — why it matters. This lets a fresh implementation run jump straight to the right code via a symbol lookup instead of re-exploring the codebase from scratch. Omit the section entirely if nothing specific applies.`
+
+// Reminder appended to EVERY refine turn (first turn via buildRefinePrompt's rule
+// 7, and every later turn in handleRefineMessage) — a first-turn-only instruction
+// doesn't reliably survive a long conversation. This asks for a tool call (curl)
+// rather than a formatting convention embedded in the reply's prose: a live test
+// showed a model produce a complete, self-described "ready to implement" plan
+// while still never adding the requested marker to its own prose. Models follow
+// "call this when done" far more reliably than "remember to also format your
+// answer a certain way" buried among several other rules.
+export function buildRefineReadyRule(issueId: string): string {
+  return `If — and only if — this reply is a complete, ready plan (no more clarifying questions, nothing you'd change if the user clicked "Consolidate" right now), ALSO call \`curl -X POST http://127.0.0.1:4390/api/refine/${issueId}/ready\` after finishing your answer — this tells the orchestrator to consolidate it into the final issue description automatically, without waiting for the user to click anything. If you still have a question or the plan needs more discussion, do NOT call this endpoint.`
+}
 
 // Sent instead of buildRefinePrompt() when a chat session already exists (e.g. the
 // page was reloaded) — Sillage doesn't persist the transcript itself, so this is how
