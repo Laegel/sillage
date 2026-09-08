@@ -6,6 +6,20 @@ set to the real local project this task belongs to. Follow the conventions
 below, and this project's own conventions (its own CLAUDE.md, linters,
 scripts) if it has any.
 
+## Live pairing sessions
+
+This section is for an interactive Claude Code session working directly with
+the developer on Pilot's own codebase — not one of the orchestrator's
+spawned Task/Refine/Driver runs tied to a Linear issue (those follow the
+Branching/Commits/Pull requests sections below instead).
+
+When the developer tasks you with a code change, commit and push it once
+you've made and verified the change — don't wait for a separate "commit/push"
+ask each time. Commit straight to whatever branch is checked out (typically
+`main`); no feature branch or PR needed for this workflow. Skip committing if
+the change is still being iterated on / unverified, or the developer says not
+to.
+
 ## Scope
 A `PreToolUse` hook confines Edit/Write/Bash to files inside this working
 directory — you cannot reach outside it. If a task genuinely requires
