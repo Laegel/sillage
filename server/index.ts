@@ -1434,10 +1434,14 @@ async function executeDriverActions(sessionId: string, projectId: string, action
           return startDriverRefine(issueId)
         case 'implement':
           return action.task ? startDriverImplement(issueId, action.task) : { ok: false, message: 'implement action missing task' }
-        case 'stop':
-          return { ok: stopIssueRun(issueId), message: 'stop requested' }
-        case 'restart':
-          return { ok: restartIssueRun(issueId), message: 'restart requested' }
+        case 'stop': {
+          const ok = stopIssueRun(issueId)
+          return { ok, message: ok ? 'stopped' : 'no active run for this issue to stop' }
+        }
+        case 'restart': {
+          const ok = restartIssueRun(issueId)
+          return { ok, message: ok ? 'restart requested' : 'no active run for this issue to restart' }
+        }
         case 'merge':
           return mergePr(issueId, projectId)
         case 'flag':
@@ -1447,6 +1451,17 @@ async function executeDriverActions(sessionId: string, projectId: string, action
       }
     })()
     broadcast({ type: 'driver_action', sessionId, action: action.action, issueId, status: result.ok ? 'done' : 'failed', message: result.message })
+    if (!result.ok) {
+      // driver_action isn't one of OWNERSHIP_TRIGGER_REASONS' event types — on
+      // success that's correct (re-notifying the Driver of its own action would
+      // be pure noise), but on failure it means the Driver has no other way to
+      // find out. restartIssueRun/stopIssueRun returning false, or a rejected
+      // startDriverRefine/startDriverImplement/mergePr/flagIncomplete, never
+      // reaches a runTask that could later broadcast 'error' — the request
+      // simply never took effect. Without this, the Driver believes a restart
+      // is now underway and waits indefinitely for a run that never started.
+      scheduleDriverEvent(sessionId, { kind: 'ownership', issueId, reason: `Your ${action.action} action failed: ${result.message}` })
+    }
     last = { action: action.action, issueId, ...result }
     if (!result.ok) return last
   }
