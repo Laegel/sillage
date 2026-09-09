@@ -598,6 +598,22 @@ async function runTask({
   return run
 }
 
+// Joins a run's narrated text (kind:'text' events only — tool calls/status/
+// separators are noise for this purpose) into the same shape refine's
+// `summary` field already uses. Without this, the Driver's ownership trigger
+// for a finished/failed implementation run said only "exit code 1" or a bare
+// thrown-error string — no idea what the agent actually did or why it
+// stopped, which is exactly the information it needs to avoid re-requesting
+// the same failed approach in a loop.
+function summarizeEvents(events: AgentEvent[]): string {
+  const text = events
+    .filter((e): e is Extract<AgentEvent, { kind: 'text' }> => e.kind === 'text')
+    .map((e) => e.text)
+    .join('')
+    .trim()
+  return text.length > 4000 ? `${text.slice(0, 4000)}\n… (truncated)` : text
+}
+
 // Shared by a fresh start and a restart. Runs one attempt in the background;
 // if `pendingRestart` gets set on the state before this attempt settles (by
 // handleRestart), the .finally() below immediately launches a fresh attempt
@@ -627,7 +643,7 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
       if (state.stopped) {
         if (!state.pendingRestart) broadcast({ type: 'stopped', issueId })
       } else {
-        broadcast({ type: 'done', issueId, exitCode: result?.exitCode })
+        broadcast({ type: 'done', issueId, exitCode: result?.exitCode, summary: summarizeEvents(state.events) })
         onDone?.({ ok: true, message: `exitCode ${result?.exitCode}` })
       }
     })
@@ -637,7 +653,7 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
         if (!state.pendingRestart) broadcast({ type: 'stopped', issueId })
       } else {
         console.error(`[task ${issueId}] failed:`, err)
-        broadcast({ type: 'error', issueId, message: err.message })
+        broadcast({ type: 'error', issueId, message: err.message, summary: summarizeEvents(state.events) })
         onDone?.({ ok: false, message: err.message })
       }
     })
@@ -1189,9 +1205,15 @@ async function flushDriverEvents(sessionId: string) {
 const OWNERSHIP_TRIGGER_REASONS: Record<string, (payload: any) => string> = {
   issue_updated: () => 'The card was updated (status/fields changed, possibly by hand).',
   pr_created: (p) => `A pull request was opened: ${p.prUrl}`,
-  done: (p) => `The implementation run finished (exit code ${p.exitCode}).`,
+  done: (p) =>
+    p.summary
+      ? `The implementation run finished (exit code ${p.exitCode}). Here's what the agent said:\n\n${p.summary}`
+      : `The implementation run finished (exit code ${p.exitCode}) with no narrated text — check git log/diff and the agent's own logs.`,
   stopped: () => 'The implementation run was stopped.',
-  error: (p) => `The run failed: ${p.message}`,
+  error: (p) =>
+    p.summary
+      ? `The run failed: ${p.message}\n\nWhat the agent said before failing:\n\n${p.summary}`
+      : `The run failed: ${p.message}`,
   refine_turn_done: (p) =>
     p.summary
       ? `A refine discussion turn finished. Here's what the agent said:\n\n${p.summary}`
@@ -2079,12 +2101,12 @@ function resumeTask(record: ActiveRunRecord): void {
       if (state.stopped) {
         if (!state.pendingRestart) broadcast({ type: 'stopped', issueId: record.key })
       } else {
-        broadcast({ type: 'done', issueId: record.key, exitCode: result.exitCode })
+        broadcast({ type: 'done', issueId: record.key, exitCode: result.exitCode, summary: summarizeEvents(state.events) })
       }
     } catch (err: any) {
       state.done = true
       console.error(`[task ${record.key}] recovered run failed:`, err)
-      broadcast({ type: 'error', issueId: record.key, message: err.message })
+      broadcast({ type: 'error', issueId: record.key, message: err.message, summary: summarizeEvents(state.events) })
     } finally {
       active.delete(record.key)
       clearActiveRun(record.key)
