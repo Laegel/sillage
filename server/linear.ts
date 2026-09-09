@@ -23,6 +23,31 @@ const AGENT_LABEL_MAP: Record<string, AgentChoice> = { Claude: 'claude', Free: '
 const AGENT_LABEL_NAMES = new Set(Object.keys(AGENT_LABEL_MAP))
 const DEFAULT_AGENT: AgentChoice = 'free'
 
+// listIssues() fans out 3-4 extra round trips per issue (state/milestone/
+// labels/children — see below); firing all of them for up to 100 issues at
+// once is up to ~400 concurrent requests, which is what produces the
+// intermittent "UnknownLinearError: Fetch failed" seen under load (e.g.
+// toggling Driver autonomous mode right after a cold cache, which calls
+// listIssues() fresh). Capping how many issues are processed at once bounds
+// the fan-out without changing the per-issue query shape.
+// ponytail: a fixed concurrency cap, not adaptive — raise it (or batch via a
+// GraphQL query that includes these fields directly) if 100-issue boards
+// still see this under normal conditions.
+const LINEAR_FANOUT_CONCURRENCY = 8
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length)
+  let next = 0
+  async function worker() {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await fn(items[i])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
 function toStatusName(state: WorkflowState | undefined): string {
   return state ? state.name : 'Backlog'
 }
@@ -81,24 +106,22 @@ export class LinearStore implements LinearStoreLike {
     return this.withCache('issues:all', async () => {
       const issues = await this.client.issues({ first: 100 })
       const nodes = issues.nodes || issues
-      return Promise.all(
-        nodes.map(async (issue: SdkIssue) => ({
-          id: issue.identifier,
-          title: issue.title,
-          description: issue.description || '',
-          status: toStatusName(await issue.state),
-          url: issue.url,
-          branchName: issue.branchName,
-          updatedAt: issue.updatedAt,
-          project: issue.projectId,
-          priority: issue.priority,
-          priorityLabel: issue.priorityLabel,
-          milestone: (await issue.projectMilestone)?.name,
-          labels: await mapLabels(issue),
-          isSubIssue: Boolean(issue.parentId),
-          hasSubIssues: await hasChildren(issue),
-        })),
-      )
+      return mapWithConcurrency(nodes, LINEAR_FANOUT_CONCURRENCY, async (issue: SdkIssue) => ({
+        id: issue.identifier,
+        title: issue.title,
+        description: issue.description || '',
+        status: toStatusName(await issue.state),
+        url: issue.url,
+        branchName: issue.branchName,
+        updatedAt: issue.updatedAt,
+        project: issue.projectId,
+        priority: issue.priority,
+        priorityLabel: issue.priorityLabel,
+        milestone: (await issue.projectMilestone)?.name,
+        labels: await mapLabels(issue),
+        isSubIssue: Boolean(issue.parentId),
+        hasSubIssues: await hasChildren(issue),
+      }))
     })
   }
 
