@@ -237,6 +237,25 @@ async function maybeRecordRegression(payload: Record<string, unknown>): Promise<
   })
 }
 
+const GITHUB_PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/
+
+// Attaches a PR to its issue and tells everyone (Linear, the UI, the Driver)
+// regardless of which of the two ways this got noticed: the Claude-specific
+// PostToolUse hook (notify-pr.js -> /hook-event -> handleHookEvent), or the
+// generic tool-call scan in broadcast() below (the only signal that exists
+// for OpenCode/Kilocode runs, which have no hook system at all — previously
+// a PR opened during one of those runs, the common case since the free tier
+// is tried first, was only ever mentioned in the agent's own narrated text,
+// never attached to the issue or surfaced to the Driver). Idempotent so
+// either path firing first doesn't duplicate the Linear write.
+function recordPrCreated(issueId: string, prUrl: string) {
+  if (issuePrUrl.get(issueId) === prUrl) return
+  issuePrUrl.set(issueId, prUrl)
+  linear.attachPr(issueId, prUrl).catch((err: any) => console.error('[pr] linear update failed:', err.message))
+  broadcast({ type: 'pr_created', prUrl, issueId })
+  broadcast({ type: 'issue_updated', issueId })
+}
+
 function broadcast(payload: Record<string, unknown>) {
   const message = JSON.stringify(payload)
   for (const ws of clients) {
@@ -251,6 +270,10 @@ function broadcast(payload: Record<string, unknown>) {
       cost: event.cost,
       tokens: event.tokens,
     })
+  }
+  if (event?.kind === 'tool_call' && event.status === 'complete' && typeof payload.issueId === 'string') {
+    const match = event.output?.match(GITHUB_PR_URL)
+    if (match) recordPrCreated(payload.issueId, match[0])
   }
   const friction = classifyFriction(payload)
   if (friction) appendFriction(friction)
@@ -321,18 +344,8 @@ async function handleHookEvent(req: IncomingMessage, res: ServerResponse) {
       json(res, 400, { ok: false, error: 'missing prUrl' })
       return
     }
-    let linearUpdated = false
-    if (issueId) {
-      try {
-        linearUpdated = await linear.attachPr(issueId, prUrl)
-      } catch (err: any) {
-        console.error('[hook] linear update failed:', err.message)
-      }
-    }
-    if (issueId) issuePrUrl.set(issueId, prUrl)
-    broadcast({ type: 'pr_created', prUrl, issueId })
-    if (issueId) broadcast({ type: 'issue_updated', issueId })
-    json(res, 200, { ok: true, linearUpdated })
+    if (issueId) recordPrCreated(issueId, prUrl)
+    json(res, 200, { ok: true })
   } catch (err: any) {
     json(res, 500, { ok: false, error: err.message })
   }
