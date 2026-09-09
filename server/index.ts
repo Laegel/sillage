@@ -1265,7 +1265,21 @@ async function routeDriverSignal(payload: Record<string, unknown>) {
       (await linear.getIssue(issueId).then((i) => i.status === 'In Progress').catch(() => false))
     if (reasonFn && !isSelfDrivenInProgress) {
       const owner = issueOwner.get(issueId)
-      if (owner) scheduleDriverEvent(owner, { kind: 'ownership', issueId, reason: reasonFn(payload) })
+      if (owner) {
+        let reason = reasonFn(payload)
+        // pr_created's own reason already states the PR fresh — appending here
+        // too would be redundant. Every OTHER trigger for an issue that already
+        // has a known PR (done, error, stall_detected, a later issue_updated...)
+        // previously said nothing about it, so on a second/third iteration —
+        // restart after review feedback, a stall while pushing a fix — the
+        // Driver had no way to know a PR already existed unless it happened to
+        // still be in context from whenever pr_created originally fired,
+        // possibly many turns and other cards ago. It would keep treating "no
+        // PR mentioned in this turn" as "no PR exists yet."
+        const existingPr = type !== 'pr_created' ? issuePrUrl.get(issueId) : undefined
+        if (existingPr) reason += `\n\n(This issue already has an open PR: ${existingPr} — the Implementer pushing more commits to the same branch on a re-run is expected, not a sign nothing happened. Don't wait for a new PR to be opened; check this one's status if unsure.)`
+        scheduleDriverEvent(owner, { kind: 'ownership', issueId, reason })
+      }
     }
   }
   if (BOARD_TRIGGER_TYPES.has(type)) {
