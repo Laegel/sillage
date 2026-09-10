@@ -58,6 +58,33 @@ export function resolveBar(issueId: string, projectDir: string): BarResolution {
   return { ok: true, mockup, cfg, params: params as Record<string, string> }
 }
 
+// resolveBar's ok:false must mean "no bar" to every consumer — EXCEPT
+// runGauntlet, which needs to tell "no design was ever intended" (stay
+// inert, exactly today's behavior) apart from "a design exists but isn't on
+// the branch currently checked out" (a git-state problem that would
+// otherwise silently turn this whole feature off with no signal at all —
+// see the commit-first ordering note on the plan). Only called when
+// resolveBar already said no, since it costs real git subprocess calls that
+// the fast, sync, filesystem-only common case shouldn't pay for.
+export async function findDivergedBarBranch(issueId: string, projectDir: string): Promise<string | undefined> {
+  let branches: string
+  try {
+    ;({ stdout: branches } = await execFileAsync('git', ['branch', '--list', `feat/${issueId}-*`, '--format=%(refname:short)'], { cwd: projectDir }))
+  } catch {
+    return undefined
+  }
+  for (const branch of branches.split('\n').map((b) => b.trim()).filter(Boolean)) {
+    try {
+      const { stdout } = await execFileAsync('git', ['ls-tree', '-r', '--name-only', branch, '--', `design/${issueId}/index.html`], { cwd: projectDir })
+      if (stdout.trim()) return branch
+    } catch {
+      // ls-tree failing for one candidate branch shouldn't abort checking
+      // the rest — just means this particular branch has no such tree entry.
+    }
+  }
+  return undefined
+}
+
 // snap chromium (both `chromium` and `chromium-browser` route to the same
 // /snap/bin/chromium here) can only read/write under $HOME — no /tmp — and
 // reuses whatever --user-data-dir it's given, so every capture gets its own
@@ -139,6 +166,20 @@ export type CaptureRoundResult = { aPath: string; bPath: string; mockupIsA: bool
 // to the caller (runGauntlet) — never passed anywhere the critic could see
 // it; the critic is handed plain A.png/B.png with no notion of which is
 // which. See buildCritiquePrompt for the other half of this.
+// The app failing to build/launch/render is the BUILDER's gap (its next
+// task should be "fix this"), whereas our own chromium/identify/convert
+// pipeline failing is OUR infra breaking (escalate, never silently retry
+// against a broken pipeline as if it were the builder's fault). `side` lets
+// the caller (runGauntlet) tell these apart without string-sniffing.
+export class CaptureSideFailure extends Error {
+  constructor(
+    public side: 'ours',
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
 export async function captureRound(bar: Extract<BarResolution, { ok: true }>, projectDir: string, issueId: string, round: number): Promise<CaptureRoundResult> {
   const roundDir = join(CRITIC_DIR, sanitizeForPath(issueId), String(round))
   mkdirSync(roundDir, { recursive: true })
@@ -147,11 +188,22 @@ export async function captureRound(bar: Extract<BarResolution, { ok: true }>, pr
   const oursPng = join(roundDir, 'ours.png')
   const profileDir = join(roundDir, 'chrome-profile')
 
+  // Mockup-side failures are ours to fix (a broken design file, chromium
+  // missing) — infra, not something a retry task can address. Only the
+  // "ours" side's failures represent something the builder can act on.
   await captureMockup(bar.mockup, mockupPng, bar.cfg.viewport, profileDir)
-  await captureOurs(projectDir, bar.cfg, bar.params, oursPng)
+  try {
+    await captureOurs(projectDir, bar.cfg, bar.params, oursPng)
+  } catch (err: any) {
+    throw new CaptureSideFailure('ours', err.message)
+  }
 
   await assertRealScreenshot(mockupPng)
-  await assertRealScreenshot(oursPng)
+  try {
+    await assertRealScreenshot(oursPng)
+  } catch (err: any) {
+    throw new CaptureSideFailure('ours', err.message)
+  }
   await normalizeTo(mockupPng, bar.cfg.viewport)
   await normalizeTo(oursPng, bar.cfg.viewport)
 

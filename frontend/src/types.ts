@@ -191,8 +191,17 @@ export type WsMessage =
   // `summary` is the run's narrated text, joined and truncated server-side —
   // it exists for the Driver's ownership status-update prompt (so it can tell
   // *why* an implementation run stopped, not just its exit code), not for the
-  // UI, which already has the full transcript via `output` events.
-  | { type: 'done'; issueId: string; exitCode: number | null; summary?: string }
+  // UI, which already has the full transcript via `output` events. `critique`
+  // is present only for an issue with a linked design mockup — same idea,
+  // for the same audience: the Driver's prompt, not the UI (no frontend
+  // consumer of it yet).
+  | {
+      type: 'done'
+      issueId: string
+      exitCode: number | null
+      summary?: string
+      critique?: { winner: 'ours'; rounds: number } | { winner: 'mockup'; exhausted: true; rounds: number; gap: string }
+    }
   | { type: 'stopped'; issueId: string }
   | { type: 'pr_created'; issueId: string; prUrl: string }
   | { type: 'issue_updated'; issueId: string }

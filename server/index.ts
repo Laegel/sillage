@@ -28,7 +28,17 @@ import {
   SILLAGE_ROOT,
 } from './agent.ts'
 import { checkRequiredTools, resolveProjectDir } from './project-map.ts'
-import { captureRound, extractVerdictFromText, recordVerdict, resolveBar, runCritique, type Verdict } from './critic.ts'
+import {
+  captureRound,
+  CaptureSideFailure,
+  findDivergedBarBranch,
+  recordVerdict,
+  resolveBar,
+  runCritique,
+  type BarResolution,
+  type CaptureRoundResult,
+  type Verdict,
+} from './critic.ts'
 import { deleteChatSession, getChatSession, saveChatSession, type ChatBackend } from './chat-store.ts'
 import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, type Plan } from './plans-store.ts'
 import { appendUsage, loadUsage } from './usage-store.ts'
@@ -633,13 +643,22 @@ function summarizeEvents(events: AgentEvent[]): string {
 // handleRestart), the .finally() below immediately launches a fresh attempt
 // for the same task — synchronously, right after active.delete(), so there's
 // no window for a stray 'start' message to race into the gap.
-function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean; message: string }) => void, fresh?: boolean) {
+type StartRunResult = { ok: boolean; message: string; exitCode?: number | null; summary?: string }
+
+// silent skips this function's own done/error/stopped broadcasts — used by
+// runGauntlet, which drives multiple attempts per issue and must control
+// exactly when the Driver (via routeDriverSignal) hears about a result: never
+// per-round, only once the whole gauntlet concludes. task_started is NOT
+// silenced — it has no OWNERSHIP_TRIGGER_REASONS entry, so it only ever
+// affects the live UI, where showing "a new round started" for each retry is
+// correct, not noise.
+function startRun(issueId: string, task: string, onDone?: (result: StartRunResult) => void, fresh?: boolean, silent?: boolean) {
   const state: ActiveState = { issueId, task, events: [], done: false, proc: null, stopped: false, pendingRestart: false, lastEventAt: Date.now() }
   active.set(issueId, state)
 
   // Recorded here rather than calling onDone directly in .then()/.catch() —
   // see the contract note in .finally() below.
-  let outcome: { ok: boolean; message: string } | null = null
+  let outcome: StartRunResult | null = null
 
   runTask({
     issueId,
@@ -659,20 +678,22 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
     .then((result) => {
       state.done = true
       if (state.stopped) {
-        if (!state.pendingRestart) broadcast({ type: 'stopped', issueId })
+        if (!state.pendingRestart && !silent) broadcast({ type: 'stopped', issueId })
       } else {
-        broadcast({ type: 'done', issueId, exitCode: result?.exitCode, summary: summarizeEvents(state.events) })
-        outcome = { ok: true, message: `exitCode ${result?.exitCode}` }
+        const summary = summarizeEvents(state.events)
+        if (!silent) broadcast({ type: 'done', issueId, exitCode: result?.exitCode, summary })
+        outcome = { ok: true, message: `exitCode ${result?.exitCode}`, exitCode: result?.exitCode, summary }
       }
     })
     .catch((err) => {
       state.done = true
       if (state.stopped) {
-        if (!state.pendingRestart) broadcast({ type: 'stopped', issueId })
+        if (!state.pendingRestart && !silent) broadcast({ type: 'stopped', issueId })
       } else {
         console.error(`[task ${issueId}] failed:`, err)
-        broadcast({ type: 'error', issueId, message: err.message, summary: summarizeEvents(state.events) })
-        outcome = { ok: false, message: err.message }
+        const summary = summarizeEvents(state.events)
+        if (!silent) broadcast({ type: 'error', issueId, message: err.message, summary })
+        outcome = { ok: false, message: err.message, summary }
       }
     })
     .finally(() => {
@@ -687,13 +708,194 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
       // stopped path above never sets it), so it resolves with an explicit
       // "stopped before completion" rather than silently never settling.
       if (state.pendingRestart) {
-        startRun(issueId, state.task, onDone)
+        startRun(issueId, state.task, onDone, undefined, silent)
       } else {
         onDone?.(outcome ?? { ok: false, message: 'run was stopped before it completed' })
       }
     })
 
   broadcast({ type: 'task_started', issueId, task })
+}
+
+// Cap is a per-card lifetime bound, not per-invocation — deliberately NOT
+// reset when runGauntlet is called again for the same issue. A Driver (or a
+// human) retrying a card whose gauntlet already exhausted all its rounds
+// must be told "already exhausted, needs a human look" again, not silently
+// restart the counter and ping-pong on the same unwinnable comparison
+// forever. The only way this clears is a win (see below) — an exhausted
+// card stays exhausted until the server restarts (memory-only, same as
+// driverAutonomyBudget/driverRepromptCount elsewhere in this file).
+const MAX_GAUNTLET_ROUNDS = 3
+const gauntletRounds = new Map<string, number>()
+
+// Promise-ifies one startRun attempt via its onDone callback — the same
+// "await one attempt" shape startDriverImplement already uses, reused here
+// for the loop's own internal stepping between rounds.
+function runGauntletAttempt(issueId: string, task: string, fresh: boolean | undefined): Promise<StartRunResult> {
+  return new Promise((resolve) => startRun(issueId, task, resolve, fresh, true))
+}
+
+// Wraps the implement/critic/retry cycle described in the gauntlet-loop
+// plan: after each implementation attempt, if the issue has a linked design
+// mockup, an independent critic blind-compares a screenshot of the running
+// app against it, and — if the mockup still wins — the critic's own gap
+// becomes the next attempt's task, until the critic picks the app's version
+// or the round cap is hit. Every attempt inside the loop runs SILENT
+// (startRun's own done/error broadcast suppressed): the Driver must never
+// see a round's raw exit code and decide the card looks done on its own —
+// that is exactly the "builder grades its own work" failure this whole
+// feature exists to remove. runGauntlet emits exactly one done/error itself,
+// once the loop actually concludes.
+//
+// Falls back to plain startRun's ordinary (non-silent) behavior the instant
+// resolveBar says there's no bar for this issue — identical to how implement
+// always worked before this feature existed. That fallback is checked fresh
+// on every attempt, not cached, so a mockup linked mid-run is picked up by
+// the very next round.
+function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: boolean; message: string }) => void, fresh?: boolean): void {
+  ;(async () => {
+    const alreadyExhausted = (gauntletRounds.get(issueId) ?? 0) >= MAX_GAUNTLET_ROUNDS
+    if (alreadyExhausted) {
+      const message = `This card's gauntlet already used all ${MAX_GAUNTLET_ROUNDS} rounds without the implementation beating its design mockup — needs a human look before trying again.`
+      await flagIncomplete(issueId, message).catch((err: any) => console.error(`[gauntlet ${issueId}] flag-on-already-exhausted failed:`, err.message))
+      broadcast({ type: 'error', issueId, message })
+      onDone?.({ ok: false, message })
+      return
+    }
+
+    let currentTask = task
+    let currentFresh = fresh
+
+    while (true) {
+      const result = await runGauntletAttempt(issueId, currentTask, currentFresh)
+      currentFresh = undefined // only the very first attempt honors an explicit "fresh" request
+
+      if (!result.ok) {
+        // Crash, rate limit, or an external stop — the implement side never
+        // genuinely finished, so there is nothing to capture or judge yet.
+        // No round burned, no flag: quota exhaustion isn't an implementation
+        // defect, and an external stop means a human already took over.
+        broadcast({ type: 'error', issueId, message: result.message, summary: result.summary })
+        onDone?.(result)
+        return
+      }
+
+      let projectDir: string
+      let bar: BarResolution
+      try {
+        const issue = await linear.getIssue(issueId)
+        projectDir = resolveProjectDir(issue.project)
+        bar = resolveBar(issueId, projectDir)
+      } catch {
+        // Can't even resolve which project/bar this is — behave exactly as
+        // if no bar exists rather than hang the run on a Linear/config hiccup.
+        broadcast({ type: 'done', issueId, exitCode: result.exitCode, summary: result.summary })
+        onDone?.(result)
+        return
+      }
+
+      if (!bar.ok) {
+        // A bar existing on some feat/<issueId>-* branch that isn't the one
+        // currently checked out is a git-state problem, not "no design was
+        // intended" — conflating the two would silently disable this whole
+        // feature the moment design-then-implement ordering slips.
+        const divergedBranch = await findDivergedBarBranch(issueId, projectDir)
+        if (divergedBranch) {
+          const message = `A design mockup exists on branch ${divergedBranch} but not on the branch this run is working from — the design and implementation branches have diverged. Merge or rebase them onto one branch; the gauntlet loop can't judge against a mockup it can't see.`
+          await flagIncomplete(issueId, message).catch((err: any) => console.error(`[gauntlet ${issueId}] flag-on-divergence failed:`, err.message))
+          broadcast({ type: 'error', issueId, message })
+          onDone?.({ ok: false, message })
+          return
+        }
+        // Genuinely no bar for this issue — exactly today's behavior.
+        broadcast({ type: 'done', issueId, exitCode: result.exitCode, summary: result.summary })
+        onDone?.(result)
+        return
+      }
+
+      const round = (gauntletRounds.get(issueId) ?? 0) + 1
+      gauntletRounds.set(issueId, round)
+      broadcast({ type: 'output', issueId, event: { kind: 'orchestrator', text: `Gauntlet round ${round}/${MAX_GAUNTLET_ROUNDS}: capturing a screenshot of the app and comparing it against the design mockup…` } })
+
+      let capture: CaptureRoundResult
+      try {
+        capture = await captureRound(bar, projectDir, issueId, round)
+      } catch (err: any) {
+        if (err instanceof CaptureSideFailure) {
+          // The app itself didn't build/launch/render — that's the
+          // builder's gap, feed it back as the next task rather than
+          // escalating. Doesn't consume a round beyond the one already
+          // counted above; the retry reuses the same round number's slot
+          // conceptually, but simplest correct behavior is just: try again.
+          currentTask = `The previous attempt didn't produce a working, screenshot-able build: ${err.message}\n\nFix this before anything else.`
+          continue
+        }
+        // Our own capture infra broke (chromium/identify/convert missing, a
+        // blank render, a genuinely pixel-identical mockup+app pair) — a bar
+        // that exists must never be silently skipped, so this escalates
+        // rather than quietly finishing as if the visual check passed.
+        const message = `The visual comparison pipeline failed and could not judge this implementation: ${err.message}`
+        await flagIncomplete(issueId, message).catch((e: any) => console.error(`[gauntlet ${issueId}] flag-on-infra-failure failed:`, e.message))
+        broadcast({ type: 'error', issueId, message })
+        onDone?.({ ok: false, message })
+        return
+      }
+
+      broadcast({ type: 'output', issueId, event: { kind: 'orchestrator', text: 'Asking an independent critic to compare the two, blind…' } })
+
+      let verdict: Verdict | undefined
+      try {
+        verdict = await runCritique({
+          roundDir: capture.roundDir,
+          intent: `${issueId}: the screen depicted in its linked design mockup`,
+          onOutput: (event) => broadcast({ type: 'output', issueId, event }),
+        })
+      } catch (err: any) {
+        const message = `The critic run itself failed: ${err.message}`
+        await flagIncomplete(issueId, message).catch(() => {})
+        broadcast({ type: 'error', issueId, message })
+        onDone?.({ ok: false, message })
+        return
+      }
+
+      if (!verdict) {
+        // Neither the verdict endpoint nor the text-fallback produced
+        // anything usable — discard this comparison. Silence must never be
+        // treated as a pass, or the whole point of an independent check
+        // evaporates the one time the critic actually fails to report.
+        const message = 'The visual critic produced no usable verdict for this round.'
+        await flagIncomplete(issueId, message).catch(() => {})
+        broadcast({ type: 'error', issueId, message })
+        onDone?.({ ok: false, message })
+        return
+      }
+
+      const winnerIsMockup = (verdict.winner === 'A') === capture.mockupIsA
+      const oursWon = !winnerIsMockup
+
+      if (oursWon) {
+        broadcast({ type: 'done', issueId, exitCode: result.exitCode, summary: result.summary, critique: { winner: 'ours', rounds: round } })
+        gauntletRounds.delete(issueId)
+        onDone?.(result)
+        return
+      }
+
+      if (round >= MAX_GAUNTLET_ROUNDS) {
+        broadcast({ type: 'done', issueId, exitCode: result.exitCode, summary: result.summary, critique: { winner: 'mockup', exhausted: true, rounds: round, gap: verdict.gap } })
+        await flagIncomplete(
+          issueId,
+          `The implementation ran ${round} round(s) against its design mockup and an independent visual critic still preferred the mockup every time. Last remaining gap: ${verdict.gap}`,
+        ).catch((err: any) => console.error(`[gauntlet ${issueId}] flag-on-exhaustion failed:`, err.message))
+        onDone?.({ ok: false, message: `gauntlet exhausted after ${round} rounds` })
+        return
+      }
+
+      // Not won yet, rounds remain — the critic's own gap sentence becomes
+      // the next attempt's task, and runTask resumes the implement:<issueId>
+      // session (the builder keeps its context; the critic never does).
+      currentTask = verdict.gap
+    }
+  })()
 }
 
 function handleStart(ws: WebSocket, payload: any) {
@@ -708,7 +910,7 @@ function handleStart(ws: WebSocket, payload: any) {
     return
   }
 
-  startRun(issueId, task, undefined, Boolean(payload.fresh))
+  runGauntlet(issueId, task, undefined, Boolean(payload.fresh))
   send(ws, { type: 'started', issueId })
 }
 
@@ -1235,10 +1437,21 @@ async function flushDriverEvents(sessionId: string) {
 const OWNERSHIP_TRIGGER_REASONS: Record<string, (payload: any) => string> = {
   issue_updated: () => 'The card was updated (status/fields changed, possibly by hand).',
   pr_created: (p) => `A pull request was opened: ${p.prUrl}`,
-  done: (p) =>
-    p.summary
+  done: (p) => {
+    // A gauntlet concluded — this replaces the plain exit-code reason
+    // entirely, not adds to it, because the whole point is that "exit code
+    // 0" is not a trustworthy signal on its own for an issue with a design
+    // bar; the critique's verdict is the actual answer.
+    if (p.critique?.winner === 'ours') {
+      return `The implementation ran and an independent visual critic — comparing a screenshot of the running app against the design mockup, blind — picked the app's version after ${p.critique.rounds} round(s). The visual bar is met. Proceed on the card's own merits (review, PR, merge).`
+    }
+    if (p.critique?.exhausted) {
+      return `The implementation ran ${p.critique.rounds} round(s) against its design mockup and an independent visual critic still preferred the mockup every time. Last remaining gap: ${p.critique.gap}\n\nThis card has been flagged for human review — do NOT merge it and do NOT propose implementing it again. Release it and say why.`
+    }
+    return p.summary
       ? `The implementation run finished (exit code ${p.exitCode}). Here's what the agent said:\n\n${p.summary}`
-      : `The implementation run finished (exit code ${p.exitCode}) with no narrated text — check git log/diff and the agent's own logs.`,
+      : `The implementation run finished (exit code ${p.exitCode}) with no narrated text — check git log/diff and the agent's own logs.`
+  },
   stopped: () => 'The implementation run was stopped.',
   error: (p) =>
     p.summary
@@ -1365,7 +1578,7 @@ function startDriverRefine(issueId: string): Promise<{ ok: boolean; message: str
 function startDriverImplement(issueId: string, task: string): Promise<{ ok: boolean; message: string }> {
   return new Promise((resolve) => {
     if (active.has(issueId)) return resolve({ ok: false, message: `${issueId} already has a run in progress — skipped.` })
-    startRun(issueId, task, resolve)
+    runGauntlet(issueId, task, resolve)
   })
 }
 
@@ -1977,31 +2190,6 @@ const server = http.createServer(async (req, res) => {
       if (!winner || !gap) return json(res, 400, { ok: false, error: 'winner ("A"|"B") and gap (non-empty string) are required' })
       if (!recordVerdict(critiqueId, { winner, gap })) return json(res, 404, { ok: false, error: 'unknown or already-answered critique' })
       return json(res, 200, { ok: true })
-    }
-    // TEMPORARY — Phase 1 standalone verification trigger for the capture +
-    // critique pipeline, ahead of Phase 2's runGauntlet. Remove once
-    // runGauntlet is the sole real caller of captureRound/runCritique.
-    const critiqueRunMatch = path.match(/^\/api\/critique\/([^/]+)\/run$/)
-    if (critiqueRunMatch && req.method === 'POST') {
-      const [, issueId] = critiqueRunMatch
-      try {
-        const body = await readBody(req)
-        const projectId = body.projectId
-        if (!projectId) return json(res, 400, { error: 'projectId is required' })
-        const projectDir = resolveProjectDir(projectId)
-        const bar = resolveBar(issueId, projectDir)
-        if (!bar.ok) return json(res, 400, { error: bar.why })
-        const round = Number(body.round) || 1
-        const capture = await captureRound(bar, projectDir, issueId, round)
-        const verdict = await runCritique({
-          roundDir: capture.roundDir,
-          intent: typeof body.intent === 'string' ? body.intent : issueId,
-          onOutput: () => {},
-        })
-        return json(res, 200, { verdict: verdict ?? null, mockupIsA: capture.mockupIsA, roundDir: capture.roundDir })
-      } catch (err: any) {
-        return json(res, 500, { error: err.message })
-      }
     }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {
