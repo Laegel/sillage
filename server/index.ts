@@ -636,6 +636,10 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
   const state: ActiveState = { issueId, task, events: [], done: false, proc: null, stopped: false, pendingRestart: false, lastEventAt: Date.now() }
   active.set(issueId, state)
 
+  // Recorded here rather than calling onDone directly in .then()/.catch() —
+  // see the contract note in .finally() below.
+  let outcome: { ok: boolean; message: string } | null = null
+
   runTask({
     issueId,
     task,
@@ -657,7 +661,7 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
         if (!state.pendingRestart) broadcast({ type: 'stopped', issueId })
       } else {
         broadcast({ type: 'done', issueId, exitCode: result?.exitCode, summary: summarizeEvents(state.events) })
-        onDone?.({ ok: true, message: `exitCode ${result?.exitCode}` })
+        outcome = { ok: true, message: `exitCode ${result?.exitCode}` }
       }
     })
     .catch((err) => {
@@ -667,13 +671,25 @@ function startRun(issueId: string, task: string, onDone?: (result: { ok: boolean
       } else {
         console.error(`[task ${issueId}] failed:`, err)
         broadcast({ type: 'error', issueId, message: err.message, summary: summarizeEvents(state.events) })
-        onDone?.({ ok: false, message: err.message })
+        outcome = { ok: false, message: err.message }
       }
     })
     .finally(() => {
       active.delete(issueId)
       clearActiveRun(issueId)
-      if (state.pendingRestart) startRun(issueId, state.task)
+      // Contract: onDone fires exactly once, after the issue is no longer
+      // active. A restart inherits the *original* onDone rather than dropping
+      // it — the caller (e.g. executeDriverActions awaiting startDriverImplement)
+      // is waiting on the task finishing, not on one particular attempt. A plain
+      // stop with no pending restart still has to resolve that same await
+      // instead of hanging it forever — `outcome` is null in that branch (the
+      // stopped path above never sets it), so it resolves with an explicit
+      // "stopped before completion" rather than silently never settling.
+      if (state.pendingRestart) {
+        startRun(issueId, state.task, onDone)
+      } else {
+        onDone?.(outcome ?? { ok: false, message: 'run was stopped before it completed' })
+      }
     })
 
   broadcast({ type: 'task_started', issueId, task })
@@ -1550,14 +1566,21 @@ async function runOwnershipUpdateTurn(
     const count = (driverRepromptCount.get(u.issueId) ?? 0) + 1
     driverRepromptCount.set(u.issueId, count)
     if (count > MAX_OWNERSHIP_REPROMPTS_PER_CARD) {
+      // Escalate to a human instead of silently abandoning the card — it went
+      // through 20 status-update turns without reaching Done, which is exactly
+      // the kind of stuck state a Driver watching quietly would otherwise hide.
+      await flagIncomplete(
+        u.issueId,
+        `Sillage carried this card through ${MAX_OWNERSHIP_REPROMPTS_PER_CARD} status-update turns without it reaching Done. Needs a human look.`,
+      ).catch((err) => console.error(`[driver ${sessionId}] flag-on-exhaustion failed:`, err.message))
       releaseOwnership(sessionId, u.issueId)
       broadcast({
         type: 'driver_action',
         sessionId,
-        action: 'release',
+        action: 'flag',
         issueId: u.issueId,
         status: 'done',
-        message: `auto-released — exceeded ${MAX_OWNERSHIP_REPROMPTS_PER_CARD} status-update turns without reaching Done`,
+        message: `escalated for human review — exceeded ${MAX_OWNERSHIP_REPROMPTS_PER_CARD} status-update turns without reaching Done`,
       })
       continue
     }
@@ -1565,6 +1588,13 @@ async function runOwnershipUpdateTurn(
   }
 
   if (stillActive.length === 0) return
+  // An ownership event is itself an activation — MAX_AUTONOMOUS_ACTIONS_PER_ACTIVATION
+  // is meant to bound one activation's worth of actions, not the whole lifetime
+  // of a session that's only ever woken by ownership triggers. Without this,
+  // budget accumulates silently across turns here (never reset) and eventually
+  // force-flips an otherwise-healthy autonomous session to manual for no
+  // reason visible to the user.
+  driverAutonomyBudget.set(sessionId, 0)
   runDriver(sessionId, projectId, () => buildDriverOwnershipUpdatePrompt(stillActive, [...(driverOwnership.get(sessionId) ?? [])]))
 }
 
