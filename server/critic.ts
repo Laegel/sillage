@@ -172,11 +172,10 @@ export type CaptureRoundResult = { aPath: string; bPath: string; mockupIsA: bool
 // against a broken pipeline as if it were the builder's fault). `side` lets
 // the caller (runGauntlet) tell these apart without string-sniffing.
 export class CaptureSideFailure extends Error {
-  constructor(
-    public side: 'ours',
-    message: string,
-  ) {
+  side: 'ours'
+  constructor(side: 'ours', message: string) {
     super(message)
+    this.side = side
   }
 }
 
