@@ -381,6 +381,35 @@ export function buildDriverOwnershipUpdatePrompt(
   return `Status update on card(s) you're watching:\n${body}\n\nYou are currently watching: ${ownedIssueIds.join(', ') || '(none)'}.\n\nThe reason given above is a terse trigger, not the full picture — if it's not enough to judge what actually happened (a vague failure, a stall, no visible progress), check the repository (git log/status/diff) and the issue's Linear comments/PR yourself before deciding, rather than guessing from the one-liner alone.\n\nFor each card above, propose a next action, release it if it's done or no longer worth watching, or do nothing. Reply as usual: text plus your fenced action block (empty array if nothing is warranted).`
 }
 
+// The gauntlet-loop critic's prompt. Binary verdict, no score — scores drift
+// upward every round and stop meaning anything, the same failure mode as an
+// LLM self-certifying "close enough." `intent` is the issue title plus one
+// line of description — the *what*, never the how-it-went: never pass the
+// implementation's own narrated summary, a git diff, the PR, or the round
+// number here, or the critic stops being independent of the builder.
+//
+// Verdict delivery is a tool call (curl), not a prose convention — a live
+// test this session proved a model can produce a fully correct, complete
+// answer while still skipping a required prose-embedded marker. A curl call
+// is something models reliably execute; "also remember to format your reply
+// a certain way" is not.
+export function buildCritiquePrompt({ intent, critiqueId }: { intent: string; critiqueId: string }): string {
+  return `Two screenshots sit in your working directory: A.png and B.png. Use the Read tool to view both.
+
+They are two attempts at the same screen: ${intent}
+
+Answer one question: which one is the better realization of that screen? Judge only what you can see — layout, spacing, alignment, hierarchy, typography, color, completeness of the elements shown. You have no information about where either image came from, how it was produced, or how much effort went into it, and you must not speculate about any of that. Do not explore the filesystem looking for context; there is none to find and it would not change the answer.
+
+There is no score and no partial credit. Pick A or B. If they are genuinely indistinguishable in quality, pick the one that is better, and if that is impossible, pick B.
+
+Then name the single biggest concrete visual gap the loser has against the winner — one specific, actionable difference, not a list and not a summary. Someone will act on exactly that one sentence and nothing else, so make it the thing that matters most.
+
+Report your verdict by running exactly this once, and nothing else:
+curl -X POST http://127.0.0.1:${process.env.PORT || 4390}/api/critique/${critiqueId}/verdict -H "Content-Type: application/json" -d '{"winner":"A","gap":"..."}'
+
+Your prose reply is discarded — the curl call is the only thing that counts. If you skip it, this comparison is thrown away and rerun.`
+}
+
 function hookCommand(file: string): string {
   return `node ${join(SILLAGE_ROOT, '.claude', 'hooks', file)}`
 }
@@ -407,6 +436,11 @@ export function spawnClaude(
   session?: { id: string; resume: boolean },
   readOnly?: boolean,
   designDir?: string,
+  // Skips --mcp-config entirely. Combined with --strict-mcp-config (still
+  // passed) that yields zero MCP servers — used by the critic, which must not
+  // be able to read the Linear issue and learn how the implementation went;
+  // it only ever sees the two screenshots. Also cuts startup time.
+  noMcp?: boolean,
 ): ChildProcess {
   const bin = process.env.CLAUDE_BIN || 'claude'
   const args = [
@@ -419,8 +453,7 @@ export function spawnClaude(
     '--permission-mode',
     'bypassPermissions',
     '--strict-mcp-config',
-    '--mcp-config',
-    join(SILLAGE_ROOT, '.claude', '.mcp.json'),
+    ...(noMcp ? [] : ['--mcp-config', join(SILLAGE_ROOT, '.claude', '.mcp.json')]),
     '--settings',
     buildSettingsJson(),
   ]
@@ -505,6 +538,7 @@ export function runClaude({
   readOnly,
   designDir,
   resume,
+  noMcp,
 }: {
   prompt: string
   projectDir: string
@@ -522,6 +556,7 @@ export function runClaude({
   // required (it names the Claude session being resumed), but no CLI process
   // is started; output comes from tailing the existing logFile instead.
   resume?: { pid: number; logFile: string }
+  noMcp?: boolean
 }): Promise<{ exitCode: number | null; needsFallback: boolean; sessionId?: string }> {
   return new Promise((resolve, reject) => {
     let result = ''
@@ -623,7 +658,7 @@ export function runClaude({
     }
 
     const logFile = openRunLog('claude', session?.id ?? randomUUID())
-    const proc = spawnClaude(prompt, projectDir, logFile, session, readOnly, designDir)
+    const proc = spawnClaude(prompt, projectDir, logFile, session, readOnly, designDir, noMcp)
     onProcess?.(proc, logFile, 'claude')
     killProc = () => proc.kill('SIGTERM')
     const stopTail = tailLines(logFile, handleLine)

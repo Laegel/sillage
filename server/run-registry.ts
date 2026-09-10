@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const STORE_FILE = resolve(__dirname, '..', 'active-runs.json')
 
-export type RunKind = 'task' | 'refine' | 'ideation' | 'driver' | 'design'
+export type RunKind = 'task' | 'refine' | 'ideation' | 'driver' | 'design' | 'critic'
 export type RunBackend = 'claude' | 'opencode' | 'kilocode' | 'mock'
 
 export interface ActiveRunRecord {

@@ -9,10 +9,27 @@ const execFileAsync = promisify(execFile)
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MAP_FILE = resolve(__dirname, '..', 'project-map.json')
 
+export interface CaptureConfig {
+  // argv for launching the real app at a specific screen/state — {out} is the
+  // screenshot destination, any other {word} is a per-issue param supplied
+  // via design/<issueId>/capture.json (see captureParamNames below).
+  command: string[]
+  // Both PNGs (mockup + app) are normalized to this size before comparison —
+  // a property of the app's own window, not of any individual issue.
+  viewport: [number, number]
+  timeoutMs?: number
+  // Overrides merged onto process.env for this launch only — e.g. ldaahbevy
+  // needs WAYLAND_DISPLAY forced empty so winit selects xvfb-run's virtual X11
+  // server instead of the real Wayland compositor (xvfb-run itself doesn't
+  // clear it; see that project's own AGENTS.md).
+  env?: Record<string, string>
+}
+
 interface ProjectMapFile {
   PROJECTS_ROOT: string
   projects: Record<string, string>
   requiredTools?: Record<string, string[]>
+  capture?: Record<string, CaptureConfig>
 }
 
 // The orchestrator's own mergePr() shells out to `gh` directly, regardless of
@@ -72,4 +89,26 @@ export async function checkRequiredTools(folder: string): Promise<void> {
   if (missing.length > 0) {
     throw new Error(`Missing required tool(s) for ${folder}: ${missing.join(', ')}. Install them or update project-map.json.`)
   }
+}
+
+// undefined means "this project has no capture command configured" — the
+// caller's job, not this function's, to treat that as "no bar, behave as
+// before" rather than an error.
+export function captureConfigFor(folder: string): CaptureConfig | undefined {
+  const map = loadMap()
+  return map.capture?.[folder]
+}
+
+const CAPTURE_PLACEHOLDER = /\{(\w+)\}/g
+
+// Derived from the command template rather than declared separately in
+// project-map.json, so the two can never drift out of sync with each other.
+export function captureParamNames(cfg: CaptureConfig): string[] {
+  const names = new Set<string>()
+  for (const arg of cfg.command) {
+    for (const match of arg.matchAll(CAPTURE_PLACEHOLDER)) {
+      if (match[1] !== 'out') names.add(match[1])
+    }
+  }
+  return [...names]
 }

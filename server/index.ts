@@ -28,6 +28,7 @@ import {
   SILLAGE_ROOT,
 } from './agent.ts'
 import { checkRequiredTools, resolveProjectDir } from './project-map.ts'
+import { captureRound, extractVerdictFromText, recordVerdict, resolveBar, runCritique, type Verdict } from './critic.ts'
 import { deleteChatSession, getChatSession, saveChatSession, type ChatBackend } from './chat-store.ts'
 import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, type Plan } from './plans-store.ts'
 import { appendUsage, loadUsage } from './usage-store.ts'
@@ -1966,6 +1967,41 @@ const server = http.createServer(async (req, res) => {
       const [, issueId] = refineReadyMatch
       refineReadyToConsolidate.add(issueId)
       return json(res, 200, { ok: true })
+    }
+    const critiqueVerdictMatch = path.match(/^\/api\/critique\/([^/]+)\/verdict$/)
+    if (critiqueVerdictMatch && req.method === 'POST') {
+      const [, critiqueId] = critiqueVerdictMatch
+      const body = await readBody(req)
+      const winner = body.winner === 'A' || body.winner === 'B' ? body.winner : null
+      const gap = typeof body.gap === 'string' ? body.gap.trim() : ''
+      if (!winner || !gap) return json(res, 400, { ok: false, error: 'winner ("A"|"B") and gap (non-empty string) are required' })
+      if (!recordVerdict(critiqueId, { winner, gap })) return json(res, 404, { ok: false, error: 'unknown or already-answered critique' })
+      return json(res, 200, { ok: true })
+    }
+    // TEMPORARY — Phase 1 standalone verification trigger for the capture +
+    // critique pipeline, ahead of Phase 2's runGauntlet. Remove once
+    // runGauntlet is the sole real caller of captureRound/runCritique.
+    const critiqueRunMatch = path.match(/^\/api\/critique\/([^/]+)\/run$/)
+    if (critiqueRunMatch && req.method === 'POST') {
+      const [, issueId] = critiqueRunMatch
+      try {
+        const body = await readBody(req)
+        const projectId = body.projectId
+        if (!projectId) return json(res, 400, { error: 'projectId is required' })
+        const projectDir = resolveProjectDir(projectId)
+        const bar = resolveBar(issueId, projectDir)
+        if (!bar.ok) return json(res, 400, { error: bar.why })
+        const round = Number(body.round) || 1
+        const capture = await captureRound(bar, projectDir, issueId, round)
+        const verdict = await runCritique({
+          roundDir: capture.roundDir,
+          intent: typeof body.intent === 'string' ? body.intent : issueId,
+          onOutput: () => {},
+        })
+        return json(res, 200, { verdict: verdict ?? null, mockupIsA: capture.mockupIsA, roundDir: capture.roundDir })
+      } catch (err: any) {
+        return json(res, 500, { error: err.message })
+      }
     }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {
