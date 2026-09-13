@@ -3,8 +3,9 @@ import { DockviewReact, themeAbyss, type DockviewReadyEvent, type IDockviewPanel
 import 'dockview-react/dist/styles/dockview.css'
 import { fetchDesignPreview, fetchDesignControls } from '../api.ts'
 import { parseDesignTokens, type DesignToken } from '../lib/designTokens.ts'
-import type { ChatMessage, DesignSession, Issue, Project } from '../types.ts'
+import type { ChatMessage, ClaudeChoice, DesignSession, IdeationCandidate, Issue, Project } from '../types.ts'
 import DesignChat from './DesignChat.tsx'
+import { CandidateCard } from './IdeationChat.tsx'
 import PreviewPanel from './panels/PreviewPanel.tsx'
 import ControlsPanel from './panels/ControlsPanel.tsx'
 import TokensPanel from './panels/TokensPanel.tsx'
@@ -17,6 +18,9 @@ type ChatPanelParams = {
   committing: boolean
   onSend: (message: string, images?: string[]) => void
   onCommit: () => void
+  onCreateIssue: (candidate: IdeationCandidate) => Promise<void>
+  choice: ClaudeChoice
+  onChoiceChange: (choice: ClaudeChoice) => void
 }
 type PreviewPanelParams = {
   html: string | null | undefined
@@ -77,6 +81,8 @@ export default function DesignView({
   onLinkIssue,
   onCommit,
   onDelete,
+  onChoiceChange,
+  onCreateIssue,
 }: {
   sessions: Record<string, DesignSession>
   selectedId: string | null
@@ -92,8 +98,11 @@ export default function DesignView({
   onLinkIssue: (sessionId: string, issueId: string) => void
   onCommit: (sessionId: string) => void
   onDelete: (sessionId: string) => void
+  onChoiceChange: (sessionId: string, choice: ClaudeChoice) => void
+  onCreateIssue: (sessionId: string, candidate: IdeationCandidate) => Promise<void>
 }) {
   const [newProjectId, setNewProjectId] = React.useState('')
+  const [filingIssue, setFilingIssue] = React.useState(false)
   const [newIssueId, setNewIssueId] = React.useState('')
   const [html, setHtml] = React.useState<string | null | undefined>(undefined)
   const [controlsHtml, setControlsHtml] = React.useState<string | null | undefined>(undefined)
@@ -164,6 +173,9 @@ export default function DesignView({
         committing: committing.has(selected.id),
         onSend: (message, images) => onSend(selected.id, message, images),
         onCommit: () => onCommit(selected.id),
+        onCreateIssue: (candidate) => onCreateIssue(selected.id, candidate),
+        choice: { model: selected.model, effort: selected.effort },
+        onChoiceChange: (choice) => onChoiceChange(selected.id, choice),
       }
     : null
   const previewParams: PreviewPanelParams = {
@@ -329,21 +341,36 @@ export default function DesignView({
       <div className="design-main">
         {selected ? (
           <>
-            {!selected.issueId && linkableIssues.length > 0 && (
+            {!selected.issueId && (
               <div className="design-link-row">
-                <select
-                  value=""
-                  onChange={(e) => e.target.value && onLinkIssue(selected.id, e.target.value)}
-                  aria-label="Link this draft to an issue"
-                >
-                  <option value="">Link to an issue…</option>
-                  {linkableIssues.map((i) => (
-                    <option key={i.id} value={i.id}>
-                      {i.id}: {i.title}
-                    </option>
-                  ))}
-                </select>
+                {linkableIssues.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => e.target.value && onLinkIssue(selected.id, e.target.value)}
+                    aria-label="Link this draft to an issue"
+                  >
+                    <option value="">Link to an issue…</option>
+                    {linkableIssues.map((i) => (
+                      <option key={i.id} value={i.id}>
+                        {i.id}: {i.title}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <button type="button" onClick={() => setFilingIssue((open) => !open)} disabled={!connected}>
+                  {filingIssue ? 'Cancel' : '+ New issue from design'}
+                </button>
               </div>
+            )}
+            {!selected.issueId && filingIssue && (
+              <CandidateCard
+                key={selected.id}
+                candidate={{ title: selected.title, description: '' }}
+                onCreate={async (candidate) => {
+                  await onCreateIssue(selected.id, candidate)
+                  setFilingIssue(false)
+                }}
+              />
             )}
             <div className="design-dock">
               <DockviewReact components={dockComponents} onReady={onReady} theme={themeAbyss} />

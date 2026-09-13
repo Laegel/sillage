@@ -23,6 +23,14 @@ export interface CaptureConfig {
   // server instead of the real Wayland compositor (xvfb-run itself doesn't
   // clear it; see that project's own AGENTS.md).
   env?: Record<string, string>
+  // Only meaningful for domInspectable projects. Same placeholder mechanism
+  // as `command`, but does the same build+serve setup and prints a live URL
+  // to stdout instead of taking a screenshot — extract.ts drives its own
+  // puppeteer navigation against that URL (one page load does both the
+  // screenshot and the DOM walk, see captureAndExtractOurs in critic.ts).
+  // No {out} placeholder here since nothing is written to disk by the
+  // command itself.
+  serveCommand?: string[]
 }
 
 interface ProjectMapFile {
@@ -30,6 +38,19 @@ interface ProjectMapFile {
   projects: Record<string, string>
   requiredTools?: Record<string, string[]>
   capture?: Record<string, CaptureConfig>
+  // true means the orchestrator will NOT serialize implement runs on this
+  // project — it does NOT mean per-run git worktrees are actually provisioned
+  // (that automation doesn't exist yet). Only set true once that's genuinely
+  // safe some other way. Missing/false is the safe default: implement runs
+  // on this project queue behind each other (see acquireProjectSlot).
+  withGitWorktrees?: Record<string, boolean>
+  // true means this project's UI has a real DOM that extract.ts can walk
+  // (a web app rendered via something like Storybook) — verifyStep's
+  // geometry branch only runs for these; everything else (a native game
+  // with no DOM at all) stays on the holistic critic. Requires the
+  // project's capture config to also set serveCommand. Missing/false is the
+  // safe default.
+  domInspectable?: Record<string, boolean>
 }
 
 // The orchestrator's own mergePr() shells out to `gh` directly, regardless of
@@ -70,6 +91,16 @@ export function resolveProjectDir(linearProjectId: string | undefined): string {
 function requiredToolsFor(folder: string): string[] {
   const map = loadMap()
   return map.requiredTools?.[folder] ?? []
+}
+
+export function supportsWorktrees(folder: string): boolean {
+  const map = loadMap()
+  return map.withGitWorktrees?.[folder] ?? false
+}
+
+export function isDomInspectable(folder: string): boolean {
+  const map = loadMap()
+  return map.domInspectable?.[folder] ?? false
 }
 
 // Runs once before any agent process is spawned for this project — a run

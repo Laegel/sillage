@@ -94,7 +94,10 @@ export type DriverActionKind = 'refine' | 'implement' | 'stop' | 'restart' | 're
 // of issueId, which every other kind needs.
 export type DriverAction =
   | { action: 'create'; title: string; description?: string }
-  | { action: Exclude<DriverActionKind, 'create'>; issueId: string; task?: string; reason?: string }
+  // `message` is the Driver's own reply/answer text to send into an ongoing
+  // refine discussion (see startDriverRefine) — distinct from the outbound
+  // `driver_action` WS broadcast's unrelated `message` status field.
+  | { action: Exclude<DriverActionKind, 'create'>; issueId: string; task?: string; reason?: string; message?: string }
 
 export interface LinearStoreLike {
   listIssues(): Promise<Issue[]>

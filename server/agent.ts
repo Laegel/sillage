@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { closeSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
 import type { AgentEvent, Comment, Issue, DriverMode } from './types.ts'
 import type { SynthesisEntry } from './synthesis-store.ts'
 
@@ -109,12 +110,27 @@ export async function buildPrompt({
   comments,
   task,
   projectDir,
+  // false only for one step of a multi-step plan (see runCard in index.ts) —
+  // every other run keeps today's behavior (undefined/true). Structural, not
+  // a sentence the model can choose to skip: a card's real "done" signal is
+  // every step passing its own independent verification, not any one run's
+  // own confidence that it finished — so only the dedicated wrap-up run that
+  // fires after that's confirmed is allowed to open the PR.
+  openPr,
 }: {
   issue: Issue
   comments: Comment[]
   task: string
   projectDir: string
+  openPr?: boolean
 }): Promise<string> {
+  const prRules =
+    openPr === false
+      ? `7. Do NOT open a PR and do NOT change this issue's Linear status yourself — this is one step of a multi-step plan; a separate final run opens the PR and updates status once every step is independently verified complete. Just commit your work normally (rule 4) so it's there for that final run to build on.
+8. Use the GitHub MCP for commit and push only — no PR creation, no status change, in this run.`
+      : `7. Before opening a PR, check whether one already exists for this branch (e.g. \`gh pr list --head <branch>\`). If one exists, just push your commits to update it — do not open a duplicate. Otherwise open it with: gh pr create --title "<title>" --body "Closes ${issue.id} — <summary>"
+8. Use the GitHub MCP for commit, push and PR creation. Use the Linear MCP to re-read the issue and, once the PR is open, set its status to "In Review" and attach the PR link as a comment.`
+
   return `You are a software engineer working in the repository at ${projectDir}.
 
 LINEAR ISSUE
@@ -131,13 +147,12 @@ ${task}
 
 RULES (also enforced by CLAUDE.md)
 1. Before doing anything else, check for existing work on this issue: run \`git branch --list 'feat/${issue.id}-*'\` and \`git status\`, and review the existing comments above — a prior attempt may have left a blocker note or partial-progress explanation there. If a matching branch already exists, check it out (if not already on it) and CONTINUE from there instead of starting over — assess what's already done (git status, git diff, git log) and what still remains, then pick up where it left off. Only create a new branch named feat/${issue.id}-<kebab-slug> (for example feat/${issue.id}-add-toggle) if none already exists.
-2. Check for a linked design mockup at design/${issue.id}/index.html (and controls.html) in this repo. If present, treat it as the UI spec: match its structure and styling rather than reinterpreting it loosely. If an element in it carries a data-component="..." attribute or a <!-- component: ... --> comment, verify that path still exists and still looks like a real match before trusting it (things may have moved since the mockup was made, same caveat as rule 3's "Relevant symbols" hint below) — if it checks out, reuse that exact existing component instead of re-implementing equivalent markup or styles; if it's gone or no longer fits, fall back to matching the mockup's appearance directly.
+2. Check for a linked design mockup at design/${issue.id}/index.html (and controls.html) in this repo. If present, treat it as the UI spec: match its structure and styling rather than reinterpreting it loosely. If an element in it carries a data-component="..." attribute or a <!-- component: ... --> comment, verify that path still exists and still looks like a real match before trusting it (things may have moved since the mockup was made, same caveat as rule 3's "Relevant symbols" hint below) — if it checks out, reuse that exact existing component instead of re-implementing equivalent markup or styles; if it's gone or no longer fits, fall back to matching the mockup's appearance directly. A generic broken-image icon, an "Art"/image-upload placeholder, or a small floating icon in a screen corner unrelated to any in-app feature (a comment/annotation/chat bubble button, cursor avatars, a rendering watermark) is chrome from the tool that exported the mockup, not part of the actual screen — recognize and skip it; never invent a fake element in the real app just to visually match it. If a mockup element carries a data-mockup-id="..." attribute, carry that same attribute and value onto the corresponding real element you implement — automated verification uses it to find elements that have no distinguishing text of their own.
 3. If the description above has a "## Relevant symbols" section, it was left by an earlier refinement discussion as a fast-path hint, not gospel — for each cited symbol, look it up (e.g. \`codegraph query <name>\`, or grep as a fallback) to confirm it still exists and still matches what's described, and start your exploration there instead of a broad search. The codebase may have moved on since it was written, so re-verify rather than trust; fall back to normal from-scratch exploration for anything missing, changed, or if the section isn't present at all.
 4. Commit messages must be prefixed with the Linear issue id: "${issue.id}: <summary>".
 5. The PR description MUST reference the Linear issue id ${issue.id}.
 6. Do NOT send any manual notification about the PR. A PostToolUse hook detects "gh pr create" and notifies the orchestrator.
-7. Before opening a PR, check whether one already exists for this branch (e.g. \`gh pr list --head <branch>\`). If one exists, just push your commits to update it — do not open a duplicate. Otherwise open it with: gh pr create --title "<title>" --body "Closes ${issue.id} — <summary>"
-8. Use the GitHub MCP for commit, push and PR creation. Use the Linear MCP to re-read the issue and, once the PR is open, set its status to "In Review" and attach the PR link as a comment.
+${prRules}
 9. If you get blocked — missing information, an ambiguous requirement, a decision only a human should make, or something you genuinely can't resolve yourself — stop rather than guessing or shipping something you're not confident in. Commit whatever real progress you've made first (so a resumed run doesn't lose it, per rule 1), then use the Linear MCP to: (a) add a comment on the issue stating exactly what's blocking you and what you need to proceed, @mentioning the workspace owner in that comment so they're actually notified (use the Linear MCP's own current-user/viewer lookup, or the issue's creator, to find who to mention — don't guess a name), (b) add the "Blocked" label to the issue, and (c) set the issue status back to "Todo". Do not open a PR for blocked or incomplete work.
 10. When you narrate progress outside of tool calls, keep it to short, single-line notes at natural checkpoints (e.g. after finishing a step) rather than long paragraphs — this is read as a live log, not a report.
 11. Do NOT write your own plan, notes, or design-doc files (e.g. PLAN.md, NOTES.md, .kilo/plans/*.md). The Linear issue is the single source of truth: if you need to record a plan of approach or a decision so it survives across turns, add it as a comment on the issue via the Linear MCP instead of a local file. This is enforced, not just requested: any such write will be denied regardless of tool (write, bash heredoc, echo redirect, sed -i, etc.) — if one is denied, that is intentional and permanent, do not retry it a different way.`
@@ -148,9 +163,11 @@ RULES (also enforced by CLAUDE.md)
 // reality-check discussion for a still-raw Backlog idea, not an implementation run.
 export async function buildRefinePrompt({
   issue,
+  comments,
   projectDir,
 }: {
   issue: Issue
+  comments: Comment[]
   projectDir: string
 }): Promise<string> {
   return `You are reviewing a Linear issue that is still an unrefined idea, in the repository at ${projectDir}.
@@ -160,10 +177,13 @@ LINEAR ISSUE
 - title: ${issue.title}
 - description: ${issue.description}
 
+EXISTING COMMENTS
+${renderComments(comments)}
+
 This is a discussion, not an implementation task — do not follow implementation steps yet.
 
 RULES FOR THIS DISCUSSION
-1. Explore the codebase read-only to check this idea against reality: does it fit the existing structure, is anything already half-built, are there naming/pattern conflicts, is anything technically infeasible as described?
+1. Explore the codebase read-only to check this idea against reality: does it fit the existing structure, is anything already half-built, are there naming/pattern conflicts, is anything technically infeasible as described? Also check the existing comments above — a prior refine or implementation attempt may have left a blocker note or partial-progress explanation there.
 2. Do NOT write or modify any files, do NOT create a git branch or commit, do NOT open a PR, and do NOT change this issue's Linear status or labels yourself — this is exploration and discussion only. This is enforced, not just requested: any write attempt will be denied regardless of tool (write, bash heredoc, echo redirect, sed -i, etc.) — if one is denied, that is intentional and permanent, do not retry it a different way, just continue read-only and answer from what you've already found.
 3. Present 2-4 concrete options or a clear feasibility assessment with trade-offs, grounded in what you actually found in the codebase (cite real file paths).
 4. If something is genuinely ambiguous or needs a decision only the user can make, ask a specific question instead of guessing.
@@ -177,9 +197,38 @@ RULES FOR THIS DISCUSSION
 // already happened once during this discussion, so capturing what was found here
 // (as name+path, not line numbers, which rot the moment anything nearby changes)
 // lets the later cold implementation run skip re-discovering it from scratch.
-export const CONSOLIDATE_PROMPT = `Based on our discussion so far, write a final, self-contained issue description that captures the agreed plan: the concrete goal, the approach, and any important constraints or decisions we made. Do not include meta-commentary about the discussion itself (no "we discussed" or "the user asked") — write it as the issue description should read on its own, ready for implementation. Do not write any code and do not touch git, GitHub, or Linear.
+//
+// The step split replaces the old "just write a description" ask: a Builder/Critic
+// loop (see runCard in index.ts) needs steps it can check mechanically, not prose
+// it has to interpret. curl, not a fenced block — a fenced-block convention for
+// this same kind of "also do X" instruction failed twice earlier (see the
+// refine-ready-signal history) while an instructed curl call has proven reliable
+// even for free-tier backends.
+export function buildConsolidatePrompt(issueId: string): string {
+  return `Based on our discussion so far, write a final, self-contained issue description that captures the agreed plan: the concrete goal, the approach, and any important constraints or decisions we made. Do not include meta-commentary about the discussion itself (no "we discussed" or "the user asked") — write it as the issue description should read on its own, ready for implementation. Do not write any code and do not touch git, GitHub, or Linear.
 
-If, while exploring, you identified specific existing symbols (functions, types, classes) that the implementation will need to read, extend, or reuse, add a "## Relevant symbols" section listing only the ones that actually matter (not everything you looked at), one per line, as: symbolName (path/to/file.ts) — why it matters. This lets a fresh implementation run jump straight to the right code via a symbol lookup instead of re-exploring the codebase from scratch. Omit the section entirely if nothing specific applies.`
+If, while exploring, you identified specific existing symbols (functions, types, classes) that the implementation will need to read, extend, or reuse, add a "## Relevant symbols" section listing only the ones that actually matter (not everything you looked at), one per line, as: symbolName (path/to/file.ts) — why it matters. This lets a fresh implementation run jump straight to the right code via a symbol lookup instead of re-exploring the codebase from scratch. Omit the section entirely if nothing specific applies.
+
+Then split the work into 2-8 sequential steps and POST them with curl — do NOT put them in the issue description or a markdown file:
+\`curl -X POST http://127.0.0.1:4390/api/plans -H "Content-Type: application/json" -d '{"title":"...","content":"...","issueId":"${issueId}","steps":[{"id":"s1","title":"...","criterion":"...","command":"..."}]}'\`
+
+Each step needs:
+- "title": a short name for the step.
+- "criterion": what must be OBSERVABLY true when the step is done — something a third party can check without judgment, not something they have to judge. Bad: "Refactor panel sizing", "Panel looks right" (still a judgment call). Good: "Launching at 800x600 with inventory open shows the \`X / 20 slots\` counter fully inside the window."
+- "command" (optional): a shell command that exits 0 when the criterion holds. Include it whenever you can write one — use this ladder: (1) a test that currently fails and would pass once the step is done — write that test and put it here; (2) any other command with a checkable exit code or output — put it here; (3) if the criterion is fundamentally about VISUAL fidelity against a specific mockup — not just "add a button" but "match this exact layout/spacing/color" — use "check":"visual" instead (see below); (4) if none of that applies, omit both "command" and "check" entirely and a separate verifier will judge the criterion by reading the repo directly — the weakest rung, only for what genuinely can't be checked mechanically or visually.
+- "check": "visual" (optional, rung 3 above — alternative to "command", never both on the same step): compares the running app against a real mockup file and judges the criterion against it. Only use this when a mockup actually exists in this repo — check first, don't assume. Pair it with "visual": {"mockup": "path/relative/to/repo/root.html", "params": {...}} — "mockup" is the real path to that file (design/<issueId>/index.html is the usual convention, but only if that's genuinely where it lives; point at the actual file otherwise), "params" is whatever this project's capture setup needs to render "ours" (e.g. a Storybook story id) if the project's own capture command requires one.
+
+  Before writing a "check":"visual" step, get real geometry instead of eyeballing the mockup yourself: \`curl -X POST http://127.0.0.1:4390/api/extract-elements -H "Content-Type: application/json" -d '{"url":"file:///absolute/path/to/mockup.html","viewport":[W,H]}'\` (viewport should match the size the mockup was designed at). This returns every visually meaningful element with its absolute position, size, and computed style. Review the list and decide which ones are genuine content worth verifying for THIS step versus incidental chrome (a decorative glow, a spacer, anything not part of the actual screen) — the same judgment you'd apply reading it by eye, just against real numbers now. Embed the survivors as "visual": {..., "candidates": [...], "viewport": [W, H]} using the extracted objects as-is (don't hand-edit their box/style fields). A step can have as few as one candidate if that's all this specific criterion is about — don't dump the whole mockup's element list onto every visual step.
+
+Before submitting, dry-run every "command" you write, right now, in this repo, exactly as written — you have Bash for this. The step isn't implemented yet, so the command is expected to fail; the point is to check it fails for the RIGHT reason:
+- If it errors on something unrelated to the feature being unbuilt yet (wrong flag, wrong path, wrong package/binary/crate name, a target that doesn't exist for a structural reason) — that's a bug in the command itself, not evidence the step is unimplemented. Fix the invocation so it's actually correct for this repo, then dry-run the fix too. Don't drop to no-command just because the first attempt didn't run — only omit "command" if you truly cannot construct one that works.
+- If it fails because the specific thing it checks (a new assertion, a new file, a new symbol) genuinely doesn't exist yet — that's correct and expected. Leave it as-is.
+- If it unexpectedly PASSES despite the feature obviously not existing yet, that is the actual red flag, not a good sign — it usually means the command isn't exercising the thing you think it is (e.g. a test-name filter that matches zero tests exits 0 having tested nothing). Rewrite it to target something that will only become true once the step is genuinely done.
+
+Store the plain command you'd type by hand — plain \`grep\`/\`cargo\`/\`npm\`/etc, no wrapper prefixes. If your own shell environment silently rewrites what you type (a proxy, a hook, an alias) before it actually runs, that rewritten form is specific to this session, not portable — the command will be replayed later by a plain, non-interactive shell that won't have the same rewriting, so store what you literally wrote, not what you observed actually executing.
+
+Only call curl once, after you've written the final description text (used as "content" above).`
+}
 
 // Reminder appended to EVERY refine turn (first turn via buildRefinePrompt's rule
 // 7, and every later turn in handleRefineMessage) — a first-turn-only instruction
@@ -273,19 +322,24 @@ export function buildDesignPrompt({
   designDir,
   issue,
   synthesis,
+  viewport,
 }: {
   projectDir: string
   designDir: string
   issue?: Issue
   synthesis?: SynthesisEntry
+  viewport?: [number, number]
 }): string {
   const issueBlock = issue ? `LINKED ISSUE\n- ${issue.id}: ${issue.title}\n- ${issue.description}\n\n` : ''
   const synthesisBlock = synthesis
     ? `PROJECT SYNTHESIS (captured ${synthesis.updatedAt} — may have drifted since, treat as background, not gospel)\n${synthesis.text}\n\n`
     : ''
+  const viewportBlock = viewport
+    ? `\n\nVIEWPORT\nSize the mockup's root container to exactly ${viewport[0]}x${viewport[1]}px — the same size this project's real screens get captured at for automated comparison. Don't design at an arbitrary or "natural" size; matching this exactly means a later fidelity check can compare positions directly with no rescaling.`
+    : ''
   return `You are a UI designer working in the repository at ${projectDir}, producing a self-contained HTML/CSS mockup of one screen.
 
-${issueBlock}${synthesisBlock}Write your mockup to ${designDir}/index.html — a single file, inline CSS in a <style> block and inline JS in a <script> block if you need interactivity. No external requests (fonts, CDNs, images by URL): the preview renders this file in a sandboxed iframe with no network access, so anything external will just fail to load. Use data: URIs or inline SVG for any imagery.
+${issueBlock}${synthesisBlock}Write your mockup to ${designDir}/index.html — a single file, inline CSS in a <style> block and inline JS in a <script> block if you need interactivity. No external requests (fonts, CDNs, images by URL): the preview renders this file in a sandboxed iframe with no network access, so anything external will just fail to load. Use data: URIs or inline SVG for any imagery.${viewportBlock}
 
 Also write ${designDir}/controls.html — a second file that contains any interactive controls for the mockup. This file is rendered in a separate sandboxed iframe next to the preview. The two iframes cannot access each other's DOM directly; they communicate by posting messages to the parent window. The parent relays messages between them.
 
@@ -305,11 +359,22 @@ If this project defines design skills under .claude/skills/, load the relevant o
 DESIGN SYSTEM
 Before you start designing, look for whatever passes for this project's existing design system — a components directory, a shared UI/ui-kit package, a storybook config, existing design tokens — and treat what you find as your starting palette and component set rather than inventing your own from scratch. If an element in your mockup corresponds to something that already exists there, don't just visually approximate it: mark it with a data-component="path/to/Component" attribute (or, for a non-file-addressable match, an HTML comment directly above it, e.g. <!-- component: src/components/Button.tsx -->) pointing at the real thing. This is the link the implementer uses later to reuse the actual component instead of rebuilding a lookalike — leave it whenever you recognize a match, even if you're not fully sure.
 
-ITERATION
+For any other meaningful element (an icon, a decorative-but-real art region, a color swatch) that has no visible text of its own and no existing component to link, give it a data-mockup-id="kebab-case-name" attribute instead — a short, stable, human-readable name. This is how later automated tooling identifies and verifies it. Purely decorative chrome (background glows, gradients, spacer elements with no semantic role) needs neither attribute.
+
+CONTENT
+When a screen shows real product data (item names, stats, character names, any in-repo entity), pull actual values from this project's own data/definitions files rather than inventing plausible-sounding placeholders. A later implementation pass needs to reproduce this exact scene — that's only possible if the content is traceable to something real, not guessed.
+
+STATES
+Identify the meaningfully different states this screen needs to handle (e.g. empty, sparse, dense, locked, boss) — not just whichever one you happen to draw first. Show the primary/most common one in index.html; make the others reachable through controls.html's post-message protocol, or at minimum note them in a comment, so a later implementation isn't only tested against the one state you happened to pick.
+
+${issue ? '' : `FILING
+This design has no linked issue yet. Once the user signals the screen is settled (they approve it, call it done, or ask to file, ship, or implement it), include alongside your normal reply exactly one fenced \`\`\`json code block containing an array with one object shaped as {"title": string, "description": string}: a self-contained implementation issue for this screen — goal, what the mockup shows, the states it must handle, and the existing components it reuses. The UI turns it into a "Create issue" card; creating it links this mockup to the new issue, where implementation picks it up. Don't propose it while the design is still changing, and don't repeat it every turn once offered.
+
+`}ITERATION
 Rewrite index.html and controls.html in place each turn rather than accumulating variants — the preview always reflects the current files' latest state, so there is only ever one live version of this screen.
 
 BOUNDARY
-Read the rest of the repository freely (existing components, styles, tokens) to match the real product's look — but you may only write inside ${designDir}. Never touch app source, git, or Linear directly; you have no access to any of them from here.`
+Read the rest of the repository freely (existing components, styles, tokens) to match the real product's look — but you may only write inside ${designDir}. Never touch app source, git, or Linear directly; you have no access to any of them from here. This mockup shows only what a real user would see on this screen — never anything about the tooling used to make it (no comment/annotation icons, cursor avatars, or editor chrome).`
 }
 
 function renderBacklog(backlog: Issue[]): string {
@@ -347,7 +412,7 @@ export async function buildDriverFirstTurnPrompt({
   return `You are the driver for a repository at ${projectDir}. Your job is to keep existing Linear issues moving — deciding when to refine or implement them, and driving the engineers (refine/implement agents) doing that work through to completion. You never *mutate* Linear or the codebase directly yourself — but you have full read access to both, and should actually use it to see what's really going on rather than guessing from a one-line status alone.
 
 OWNERSHIP
-Any card you propose refine/implement/stop/restart on — or one you just created — becomes one you're responsible for watching end-to-end: you'll automatically get a status-update turn (not a real user message) whenever something relevant happens to it — a run finishes, a pull request lands, someone edits it by hand, or it looks stuck — until it reaches Done or you explicitly release it. When you get one of these turns, propose a next action for the card, release it (with a reason) if it's done or no longer worth watching, or do nothing if it just needs more time. If the status update alone doesn't tell you enough to judge what actually happened (e.g. "the run failed" with no detail, or repeated stalls with no visible progress), go check for yourself before deciding — see DIAGNOSING below. Don't conclude a run is stuck or failed just because you weren't handed the reason; look first.
+Any card you propose refine/implement/stop/restart on — or one you just created — becomes one you're responsible for watching end-to-end: you'll automatically get a status-update turn (not a real user message) whenever something relevant happens to it — a run finishes, a pull request lands, someone edits it by hand, or it looks stuck — until it reaches Done or you explicitly release it. When you get one of these turns, propose a next action for the card, release it (with a reason) if it's done or no longer worth watching, or do nothing if it just needs more time. If the status update alone doesn't tell you enough to judge what actually happened (e.g. "the run failed" with no detail, or repeated stalls with no visible progress), go check for yourself before deciding — see DIAGNOSING below. Don't conclude a run is stuck or failed just because you weren't handed the reason; look first. A refined card carries its own step-by-step plan and runs each step through its own implement-then-verify cycle on its own — you just implement/stop/restart the card as a whole and wait for its next status update, you never need to (and can't) micromanage which step it's on.
 
 DIAGNOSING
 You have real tools, use them: Read/Grep/Bash (read-only — commands that inspect, not ones that write or commit) to check the repository directly (git log, git status, git diff, file contents), and the Linear MCP tools to read the issue's comments, attached PR, and current fields. This is how you find out whether an implement/refine run actually made progress, what a PR/comment says, or why something looks stalled — don't treat "I wasn't told why" as "there's no way to know."
@@ -355,7 +420,7 @@ You have real tools, use them: Read/Grep/Bash (read-only — commands that inspe
 ${modeFraming}
 
 HOW TO PROPOSE AN ACTION
-Reply with your normal conversational text, plus exactly one fenced \`\`\`json code block containing an array of objects shaped as {"action": "refine"|"implement"|"stop"|"restart"|"release"|"merge"|"flag"|"create", "issueId"?: string, "task"?: string, "reason"?: string, "title"?: string, "description"?: string}. "issueId" is required for every action except "create", which has no existing issue yet and instead needs "title" (required) and "description" (optional, but write one — see below). "task" is required for "implement" (a self-contained instruction for what to build/fix). "reason" is required for "release" (why you're done watching this card) and "flag" (what's wrong) and unused otherwise. An empty array means no action this turn.
+Reply with your normal conversational text, plus exactly one fenced \`\`\`json code block containing an array of objects shaped as {"action": "refine"|"implement"|"stop"|"restart"|"release"|"merge"|"flag"|"create", "issueId"?: string, "task"?: string, "reason"?: string, "title"?: string, "description"?: string, "message"?: string}. "issueId" is required for every action except "create", which has no existing issue yet and instead needs "title" (required) and "description" (optional, but write one — see below). "task" is required for "implement" (a self-contained instruction for what to build/fix). "reason" is required for "release" (why you're done watching this card) and "flag" (what's wrong) and unused otherwise. "message" is only for "refine" on a card you're already mid-discussion with: your actual reply — e.g. the answer to a clarifying question it just asked you — sent into that same conversation exactly as if you'd typed it. Omit it to just ask for a recap instead. It only does anything once a discussion is already underway; on a card's first-ever refine there's no conversation yet to reply into, so it's ignored (the full issue and its comments are already given to that first turn). An empty array means no action this turn.
 
 Propose "merge" once you're confident a card's PR is ready — merging is irreversible, so if you're not sure, check it first (\`gh pr view <url>\` or the GitHub MCP, for CI/review status) rather than merging speculatively. The existing pr_created trigger already tells you the moment a PR lands, giving you a natural point to decide then or wait.
 
@@ -398,7 +463,9 @@ export function buildCritiquePrompt({ intent, critiqueId }: { intent: string; cr
 
 They are two attempts at the same screen: ${intent}
 
-Answer one question: which one is the better realization of that screen? Judge only what you can see — layout, spacing, alignment, hierarchy, typography, color, completeness of the elements shown. You have no information about where either image came from, how it was produced, or how much effort went into it, and you must not speculate about any of that. Do not explore the filesystem looking for context; there is none to find and it would not change the answer.
+Answer one question: which one is the better realization of that screen? Judge only what you can see — layout, spacing, alignment, hierarchy, typography, color, and whether the same elements are present. You have no information about where either image came from, how it was produced, or how much effort went into it, and you must not speculate about any of that. Do not explore the filesystem looking for context; there is none to find and it would not change the answer.
+
+A generic broken-image icon, an "Art"/image label, a dashed upload border, or "browse files" text marks a placeholder for artwork, not a defect. Treat that region as equivalent to real art — judge only its size, position, and surrounding layout — on either image. Never let one side simply having real art while the other has placeholders decide the verdict.
 
 There is no score and no partial credit. Pick A or B. If they are genuinely indistinguishable in quality, pick the one that is better, and if that is impossible, pick B.
 
@@ -408,6 +475,29 @@ Report your verdict by running exactly this once, and nothing else:
 curl -X POST http://127.0.0.1:${process.env.PORT || 4390}/api/critique/${critiqueId}/verdict -H "Content-Type: application/json" -d '{"winner":"A","gap":"..."}'
 
 Your prose reply is discarded — the curl call is the only thing that counts. If you skip it, this comparison is thrown away and rerun.`
+}
+
+// Used only when a step has no "command" — the criterion couldn't be reduced
+// to something mechanically checkable, so a fresh, independent read of the
+// repo has to judge it directly. Unlike the visual critic, this one runs
+// inside the real project directory and needs real repo access (grep, run
+// tests, launch the app) — blindness here isn't about which screenshot is
+// the reference, it's about not inheriting the builder's own framing of
+// whether it succeeded.
+export function buildVerifyPrompt({ criterion, verifyId }: { criterion: string; verifyId: string }): string {
+  return `You are verifying one specific, narrow claim about the repository in your current working directory. Do not review anything else — no other files than what's needed to check this, no broader code review, no opinion on code quality.
+
+CLAIM TO VERIFY
+${criterion}
+
+Investigate using whatever read-only exploration and check commands you need (grep, read files, run tests, run the app) to determine whether this claim is true right now, in the code as it currently exists. Do not modify anything.
+
+Report your verdict by running exactly this once, and nothing else:
+curl -X POST http://127.0.0.1:${process.env.PORT || 4390}/api/verify/${verifyId}/result -H "Content-Type: application/json" -d '{"pass":true,"detail":"..."}'
+
+"pass" is true or false. "detail" is one sentence: if true, what you confirmed; if false, exactly what's missing or wrong.
+
+Your prose reply is discarded — the curl call is the only thing that counts. If you skip it, this verification is thrown away and treated as failed.`
 }
 
 function hookCommand(file: string): string {
@@ -429,6 +519,21 @@ function buildSettingsJson(): string {
   })
 }
 
+// Per-session model/effort picked in the Ideation/Design header. Unset means
+// the CLI's own default (~/.claude/settings.json `model`, Claude's default
+// effort) — the behavior before this existed. Allowlisted because the values
+// arrive over the WebSocket and end up as CLI args.
+export const CLAUDE_MODELS = ['fable', 'opus', 'sonnet', 'haiku'] as const
+export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type ClaudeChoice = { model?: (typeof CLAUDE_MODELS)[number]; effort?: (typeof CLAUDE_EFFORTS)[number] }
+
+export function parseClaudeChoice(payload: { model?: unknown; effort?: unknown }): ClaudeChoice {
+  return {
+    model: CLAUDE_MODELS.find((m) => m === payload.model),
+    effort: CLAUDE_EFFORTS.find((e) => e === payload.effort),
+  }
+}
+
 export function spawnClaude(
   prompt: string,
   projectDir: string,
@@ -441,6 +546,7 @@ export function spawnClaude(
   // be able to read the Linear issue and learn how the implementation went;
   // it only ever sees the two screenshots. Also cuts startup time.
   noMcp?: boolean,
+  choice?: ClaudeChoice,
 ): ChildProcess {
   const bin = process.env.CLAUDE_BIN || 'claude'
   const args = [
@@ -472,6 +578,8 @@ export function spawnClaude(
   if (readOnly) args.push('--disallowedTools', 'Edit,Write,NotebookEdit,Task')
   else if (designDir) args.push('--disallowedTools', 'Task')
   if (session) args.push(session.resume ? '--resume' : '--session-id', session.id)
+  if (choice?.model) args.push('--model', choice.model)
+  if (choice?.effort) args.push('--effort', choice.effort)
   const outFd = openSync(logFile, 'a')
   try {
     return spawn(bin, args, {
@@ -539,6 +647,7 @@ export function runClaude({
   designDir,
   resume,
   noMcp,
+  choice,
 }: {
   prompt: string
   projectDir: string
@@ -557,6 +666,7 @@ export function runClaude({
   // is started; output comes from tailing the existing logFile instead.
   resume?: { pid: number; logFile: string }
   noMcp?: boolean
+  choice?: ClaudeChoice
 }): Promise<{ exitCode: number | null; needsFallback: boolean; sessionId?: string }> {
   return new Promise((resolve, reject) => {
     let result = ''
@@ -658,7 +768,7 @@ export function runClaude({
     }
 
     const logFile = openRunLog('claude', session?.id ?? randomUUID())
-    const proc = spawnClaude(prompt, projectDir, logFile, session, readOnly, designDir, noMcp)
+    const proc = spawnClaude(prompt, projectDir, logFile, session, readOnly, designDir, noMcp, choice)
     onProcess?.(proc, logFile, 'claude')
     killProc = () => proc.kill('SIGTERM')
     const stopTail = tailLines(logFile, handleLine)
@@ -742,6 +852,18 @@ const PLAN_FILE_DENY_PATTERNS = ['.kilo/plans/*.md', 'plans/*.md', '.plans/*.md'
 // fallback this was meant to catch, misfiring on real (invisible) progress.
 // Denying "task" forces exploration through read/grep/bash instead, which do
 // stream a tool_use event each, keeping the watchdog's liveness check valid.
+//
+// Shared skills (vault-owned, see second-brain "Agentic Working Practices") sit
+// outside every project, so the external_directory deny also blocked reading a
+// skill's supporting files (references/, templates/) — confirmed live. They're
+// readable but never editable: ~/.claude/skills is a symlink into the vault, and
+// opencode's edit went straight through it until denied. The leading `*` is
+// required — confirmed live that the bare absolute-path pattern doesn't match.
+const SHARED_SKILL_DIRS = [
+  join(homedir(), '.claude', 'skills'),
+  join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'kilo', 'skills'),
+]
+
 async function buildRunnerConfigContent(projectDir: string): Promise<string> {
   return JSON.stringify({
     permission: {
@@ -749,8 +871,12 @@ async function buildRunnerConfigContent(projectDir: string): Promise<string> {
         [`${projectDir}/*`]: 'allow',
         [projectDir]: 'allow',
         '*': 'deny',
+        ...Object.fromEntries(SHARED_SKILL_DIRS.map((dir) => [`${dir}/*`, 'allow'])),
       },
-      edit: Object.fromEntries(PLAN_FILE_DENY_PATTERNS.map((pattern) => [pattern, 'deny'])),
+      edit: Object.fromEntries([
+        ...PLAN_FILE_DENY_PATTERNS.map((pattern) => [pattern, 'deny']),
+        ...SHARED_SKILL_DIRS.map((dir) => [`*${dir}/*`, 'deny']),
+      ]),
       task: { '*': 'deny' },
     },
     mcp: await loadMcpConfig(),

@@ -84,6 +84,56 @@ export interface UsageEntry {
   tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number; reasoning?: number }
 }
 
+// Mirrors server/friction-store.ts's FrictionKind.
+export type FrictionKind =
+  | 'run_failed'
+  | 'stalled'
+  | 'rate_limited'
+  | 'backend_fallback'
+  | 'tool_denied'
+  | 'tool_error'
+  | 'agent_blocked'
+  | 'driver_action_failed'
+  | 'ownership_exhausted'
+  | 'status_regression'
+  | 'run_busy'
+
+export interface FrictionEntry {
+  kind: FrictionKind
+  timestamp: string
+  issueId?: string
+  sessionId?: string
+  project?: string
+  backend?: string
+  source?: 'backfill'
+  detail: string
+}
+
+// Mirrors server/step-metrics-store.ts's StepAttempt.
+export type StepOutcome = 'passed' | 'retrying' | 'exhausted' | 'check_infra' | 'builder_failed'
+
+export interface StepAttempt {
+  timestamp: string
+  issueId: string
+  planId: string
+  phase: 'step' | 'wrap_up'
+  stepId?: string
+  stepTitle?: string
+  stepIndex?: number
+  stepCount: number
+  attempt?: number
+  backend?: string
+  model?: string
+  builderMs: number
+  checkMs?: number
+  checker?: 'command' | 'visual' | 'verifier'
+  verdict?: 'pass' | 'fail' | 'infra'
+  verdictDetail?: string
+  outcome: StepOutcome
+  builderFailure?: 'rate_limited' | 'no_changes' | 'no_output' | 'stopped' | 'error'
+  builderDetail?: string
+}
+
 export interface SynthesisEntry {
   text: string
   updatedAt: string
@@ -141,10 +191,20 @@ export interface DriverSession {
   messages: ChatMessage[]
 }
 
+// Mirrors server/agent.ts CLAUDE_MODELS/CLAUDE_EFFORTS (the server allowlists
+// them again). Unset = the Claude CLI's own default.
+export const CLAUDE_MODELS = ['fable', 'opus', 'sonnet', 'haiku'] as const
+export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export interface ClaudeChoice {
+  model?: (typeof CLAUDE_MODELS)[number]
+  effort?: (typeof CLAUDE_EFFORTS)[number]
+}
+
 // Client-owned, mirroring how refine chat transcripts only ever live in
 // localStorage (see refineHistory.ts) — the server never stores a session's
 // title, projectId, or messages, only {backend, sessionId} for continuity.
-export interface IdeationSession {
+// The model/effort choice lives here too and rides along on every message.
+export interface IdeationSession extends ClaudeChoice {
   id: string
   title: string
   projectId: string
@@ -154,13 +214,23 @@ export interface IdeationSession {
 
 // Extends IdeationSession's shape with one field — the linked issue (if any)
 // drives its output folder and whether "Commit to branch" is available.
-export interface DesignSession {
+export interface DesignSession extends ClaudeChoice {
   id: string
   title: string
   projectId: string
   issueId?: string
   createdAt: string
   messages: ChatMessage[]
+}
+
+export interface Step {
+  id: string
+  title: string
+  criterion: string
+  command?: string
+  status: 'pending' | 'done'
+  attempts: number
+  lastFailure?: string
 }
 
 export interface Plan {
@@ -171,6 +241,7 @@ export interface Plan {
   sessionId?: string
   createdAt: string
   appliedAt?: string
+  steps?: Step[]
 }
 
 export type WsMessage =
@@ -192,28 +263,30 @@ export type WsMessage =
   // it exists for the Driver's ownership status-update prompt (so it can tell
   // *why* an implementation run stopped, not just its exit code), not for the
   // UI, which already has the full transcript via `output` events. `critique`
-  // is present only for an issue with a linked design mockup — same idea,
-  // for the same audience: the Driver's prompt, not the UI (no frontend
-  // consumer of it yet).
+  // is the old visual-gauntlet-only signal (still emitted by runGauntlet for
+  // any card with no step plan); `steps` is its per-step-loop successor
+  // (runCard) — both audiences are the Driver's prompt, not the UI, which has
+  // no consumer of either yet. `critique` goes away once runGauntlet does.
   | {
       type: 'done'
       issueId: string
       exitCode: number | null
       summary?: string
       critique?: { winner: 'ours'; rounds: number } | { winner: 'mockup'; exhausted: true; rounds: number; gap: string }
+      steps?: { done: number; total: number }
     }
   | { type: 'stopped'; issueId: string }
   | { type: 'pr_created'; issueId: string; prUrl: string }
   | { type: 'issue_updated'; issueId: string }
   | { type: 'issue_created'; issue?: Issue; issueId?: string }
   | { type: 'issue_removed'; issueId: string }
-  | { type: 'error'; issueId?: string; sessionId?: string; message: string; summary?: string }
+  | { type: 'error'; issueId?: string; sessionId?: string; message: string; summary?: string; steps?: { done: number; total: number; failedStep?: string; lastFailure?: string } }
   | { type: 'refine_turn_started'; issueId: string }
   | { type: 'refine_output'; issueId: string; event: AgentEvent }
   // `summary` is the turn's accumulated text output, plain (not markdown-rendered)
   // and truncated server-side — it exists for the Driver's ownership status-update
   // prompt, not for the UI, which already has the full transcript via refine_output.
-  | { type: 'refine_turn_done'; issueId: string; summary?: string; isConsolidation?: boolean }
+  | { type: 'refine_turn_done'; issueId: string; summary?: string; isConsolidation?: boolean; autoApplied?: 'applied' | 'no_plan' }
   | { type: 'ideation_turn_started'; sessionId: string }
   | { type: 'ideation_output'; sessionId: string; event: AgentEvent }
   | { type: 'ideation_turn_done'; sessionId: string }

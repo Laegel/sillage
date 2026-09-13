@@ -1,9 +1,11 @@
 import React from 'react'
-import type { AgentEvent, ChatMessage, IdeationCandidate } from '../types.ts'
+import type { ChatMessage, ClaudeChoice, IdeationCandidate } from '../types.ts'
 import ChatThread from './ChatThread.tsx'
-import { parseCandidates, stripJsonBlock } from '../lib/ideationExtract.ts'
+import ClaudeChoicePicker from './ClaudeChoicePicker.tsx'
+import { withCandidateEvents } from '../lib/ideationExtract.ts'
 
-function CandidateCard({
+// Also used by DesignChat/DesignView to file a mockup as a new issue.
+export function CandidateCard({
   candidate,
   onCreate,
 }: {
@@ -43,7 +45,7 @@ function CandidateCard({
   )
 }
 
-function IdeationCandidatesRenderer({
+export function IdeationCandidatesRenderer({
   data,
   onCreate,
 }: {
@@ -67,6 +69,8 @@ export default function IdeationChat({
   running,
   onSend,
   onCreateCandidate,
+  choice,
+  onChoiceChange,
 }: {
   sessionId: string
   projectId: string
@@ -74,26 +78,14 @@ export default function IdeationChat({
   running: boolean
   onSend: (message: string, images?: string[]) => void
   onCreateCandidate: (sessionId: string, candidate: IdeationCandidate, projectId: string) => Promise<void>
+  choice: ClaudeChoice
+  onChoiceChange: (choice: ClaudeChoice) => void
 }) {
-  // Candidates are derived per-message and injected as a synthetic
-  // ideation_candidates event into that specific message's own event list —
-  // this makes the card render inline, right where it was proposed, and only
-  // there, instead of once globally per session.
-  const cleanedMessages = React.useMemo(
-    () =>
-      messages.map((m) => {
-        const candidates = parseCandidates(m.events)
-        if (!candidates) return m
-        const strippedEvents: AgentEvent[] = m.events.map((e) =>
-          e.kind === 'text' ? { ...e, text: stripJsonBlock(e.text) } : e,
-        )
-        return { ...m, events: [...strippedEvents, { kind: 'ideation_candidates', candidates } as AgentEvent] }
-      }),
-    [messages],
-  )
+  const cleanedMessages = React.useMemo(() => withCandidateEvents(messages), [messages])
 
   return (
     <div className="ideation-chat">
+      <ClaudeChoicePicker choice={choice} onChange={onChoiceChange} />
       <ChatThread
         messages={cleanedMessages}
         running={running}

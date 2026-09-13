@@ -648,6 +648,48 @@ body {
   margin-top: 4px;
 }
 
+.plan-steps {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.plan-steps h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.plan-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.plan-step input[type='checkbox'] {
+  margin-top: 2px;
+}
+
+.plan-step-title {
+  display: block;
+  font-weight: 600;
+}
+
+.plan-step-criterion {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
 .sub-issues {
   margin-top: 16px;
   padding-top: 16px;
@@ -1261,6 +1303,120 @@ body {
   padding: 2px 0;
 }
 
+/* Friction panel — reuses .usage-view/.usage-stat/.usage-chart-card; these
+   are only the pieces that view doesn't already have. */
+/* Steps panel — also reuses .usage-* and .friction-* pieces. */
+.steps-stats {
+  flex-wrap: wrap;
+}
+
+.friction-entry.steps-entry {
+  grid-template-columns: minmax(120px, max-content) minmax(110px, max-content) 1fr max-content;
+}
+
+.steps-outcome {
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+
+.steps-outcome-pass {
+  color: var(--green);
+}
+
+.steps-outcome-retry {
+  color: var(--amber);
+}
+
+.steps-outcome-fail {
+  color: var(--red);
+}
+
+.steps-detail {
+  color: var(--muted);
+}
+
+.steps-cell-name {
+  color: var(--text);
+  min-width: 180px;
+}
+
+.friction-stat {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.friction-stat.active {
+  border-color: var(--accent);
+}
+
+.friction-entry {
+  display: grid;
+  grid-template-columns: minmax(90px, max-content) 1fr max-content;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 5px 0;
+  border-top: 1px solid var(--border);
+}
+
+.friction-entry-blocked .friction-owner {
+  color: var(--amber);
+}
+
+.friction-owner {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.friction-detail {
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.friction-when {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.friction-kind {
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.friction-kind-harness {
+  color: var(--red);
+}
+
+.friction-kind-tool,
+.friction-kind-blocked {
+  color: var(--amber);
+}
+
+.friction-group {
+  margin-top: 10px;
+}
+
+.friction-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.friction-count {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.friction-empty {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0;
+}
+
 .chat-attachment-thumb {
   position: relative;
   display: inline-block;
@@ -1673,6 +1829,12 @@ body {
   cursor: pointer;
 }
 
+.claude-choice {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .ideation-new-btn,
 .driver-new-btn,
 .design-new-btn {
@@ -1981,6 +2143,12 @@ body {
 
 .design-link-row {
   padding: 10px 0;
+  display: flex;
+  gap: 8px;
+}
+
+.design-main > .ideation-candidate {
+  margin-bottom: 10px;
 }
 
 .design-link-row select {

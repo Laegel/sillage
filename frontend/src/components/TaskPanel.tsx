@@ -1,6 +1,6 @@
 import React from 'react'
-import type { ChatMessage, Issue, SubIssue } from '../types.ts'
-import { fetchSubIssues } from '../api.ts'
+import type { ChatMessage, Issue, Step, SubIssue } from '../types.ts'
+import { fetchPlansForIssue, fetchSubIssues } from '../api.ts'
 import RefineChat from './RefineChat.tsx'
 
 export default function TaskPanel({
@@ -48,6 +48,7 @@ export default function TaskPanel({
   const [saving, setSaving] = React.useState(false)
   const [width, setWidth] = React.useState<'sm' | 'md' | 'lg'>('md')
   const [subIssues, setSubIssues] = React.useState<SubIssue[]>([])
+  const [steps, setSteps] = React.useState<Step[]>([])
 
   React.useEffect(() => {
     setTask(issue.description || '')
@@ -65,6 +66,15 @@ export default function TaskPanel({
       .then((data) => setSubIssues(data.subIssues))
       .catch(() => setSubIssues([]))
   }, [issue.id, issue.hasSubIssues])
+
+  // Latest plan with a non-empty step list, mirroring getActivePlanForIssue on
+  // the server — read-only for now, no status flips until the Builder/Critic
+  // loop (Phase 3) actually runs steps and updates them.
+  React.useEffect(() => {
+    fetchPlansForIssue(issue.id)
+      .then((data) => setSteps(data.plans.find((p) => p.steps && p.steps.length > 0)?.steps || []))
+      .catch(() => setSteps([]))
+  }, [issue.id])
 
   const handleStop = () => onStop(issue.id)
   const handleRestart = () => onRestart(issue.id)
@@ -195,6 +205,20 @@ export default function TaskPanel({
           </div>
           {!connected && <span className="hint">Connecting to orchestrator…</span>}
         </form>
+      )}
+      {steps.length > 0 && (
+        <div className="plan-steps">
+          <h3>Steps</h3>
+          {steps.map((step) => (
+            <label key={step.id} className="plan-step">
+              <input type="checkbox" checked={step.status === 'done'} disabled readOnly />
+              <span>
+                <span className="plan-step-title">{step.title}</span>
+                <span className="plan-step-criterion">{step.criterion}</span>
+              </span>
+            </label>
+          ))}
+        </div>
       )}
       {subIssues.length > 0 && (
         <div className="sub-issues">

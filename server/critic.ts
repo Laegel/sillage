@@ -1,10 +1,11 @@
-import { execFile, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildCritiquePrompt, runClaude, SILLAGE_ROOT } from './agent.ts'
-import { captureConfigFor, captureParamNames, type CaptureConfig } from './project-map.ts'
+import { buildCritiquePrompt, buildVerifyPrompt, runClaude, SILLAGE_ROOT } from './agent.ts'
+import { extractElementsAndScreenshot, type ExtractedElement } from './extract.ts'
+import { captureConfigFor, captureParamNames, isDomInspectable, type CaptureConfig } from './project-map.ts'
 import type { AgentEvent } from './types.ts'
 
 const execFileAsync = promisify(execFile)
@@ -25,28 +26,68 @@ export type BarResolution =
   | { ok: true; mockup: string; cfg: CaptureConfig; params: Record<string, string> }
   | { ok: false; why: string }
 
-export function resolveBar(issueId: string, projectDir: string): BarResolution {
+// A design tool export (index.html) needs chromium to render; a plain
+// screenshot someone drops in the design/<issueId> folder doesn't — see
+// captureMockup below, which skips chromium entirely for these extensions.
+const MOCKUP_IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg']
+
+// Prefers a static image over the HTML export when both exist — a real
+// screenshot is a more faithful "what this should look like" than
+// re-rendering the export, which can differ from how a human's own browser
+// renders it (e.g. placeholder-widget states depending on JS timing). Applies
+// whether the .html path came from a step's explicit override or the default
+// convention — a step naming index.html explicitly is naming "this design,"
+// not "definitely re-render it with chromium," and a Refiner drafting a step
+// has no reason to know a sibling screenshot was later added.
+function preferSiblingImage(mockupPath: string): string {
+  if (!mockupPath.toLowerCase().endsWith('.html')) return mockupPath
+  const withoutExt = mockupPath.slice(0, -'.html'.length)
+  for (const ext of MOCKUP_IMAGE_EXTENSIONS) {
+    const candidate = withoutExt + ext
+    if (existsSync(candidate)) return candidate
+  }
+  return mockupPath
+}
+
+// `step` is optional so the old (pre-check:'visual') no-plan callers — still
+// used by runGauntlet — keep working unchanged. When a step is given, it can
+// override where the mockup lives and what capture params to use, since a
+// real mockup often lives wherever the design tool actually exported it
+// (design/<issueId>/index.html is a convention, not a guarantee — see
+// verifyStep's visual branch and Step.visual in plans-store.ts).
+export function resolveBar(
+  issueId: string,
+  projectDir: string,
+  step?: { visual?: { mockup?: string; params?: Record<string, string> } },
+): BarResolution {
   // Mirrors resolveDesignDir's linked-session branch (server/index.ts) without
   // needing a sessionId — a linked design's path is always design/<issueId>,
   // and the on-disk linkage (handleDesignLinkIssue's rename) is the durable
   // half; the in-memory designSessionIssue map is not consulted here on
   // purpose, since it's lost on every server restart.
   const designDir = join(projectDir, 'design', issueId)
-  const mockup = join(designDir, 'index.html')
-  if (!existsSync(mockup)) return { ok: false, why: 'no design mockup linked to this issue' }
+  const mockup = preferSiblingImage(step?.visual?.mockup ? join(projectDir, step.visual.mockup) : join(designDir, 'index.html'))
+  if (!existsSync(mockup)) {
+    return { ok: false, why: step?.visual?.mockup ? `mockup not found at ${step.visual.mockup}` : 'no design mockup linked to this issue' }
+  }
 
   const cfg = captureConfigFor(basename(projectDir))
   if (!cfg) return { ok: false, why: `no capture command configured for project "${basename(projectDir)}"` }
 
-  const captureJsonPath = join(designDir, 'capture.json')
-  if (!existsSync(captureJsonPath)) return { ok: false, why: 'mockup exists but has no capture.json alongside it' }
-
   let params: Record<string, unknown>
-  try {
-    const parsed = JSON.parse(readFileSync(captureJsonPath, 'utf8'))
-    params = (parsed && typeof parsed === 'object' && parsed.params) || {}
-  } catch {
-    return { ok: false, why: 'capture.json exists but is not valid JSON' }
+  if (step?.visual?.params) {
+    params = step.visual.params
+  } else {
+    const captureJsonPath = join(designDir, 'capture.json')
+    if (!existsSync(captureJsonPath)) {
+      return { ok: false, why: 'mockup exists but has no capture.json alongside it (and the step supplied no visual.params)' }
+    }
+    try {
+      const parsed = JSON.parse(readFileSync(captureJsonPath, 'utf8'))
+      params = (parsed && typeof parsed === 'object' && parsed.params) || {}
+    } catch {
+      return { ok: false, why: 'capture.json exists but is not valid JSON' }
+    }
   }
 
   const required = captureParamNames(cfg)
@@ -75,7 +116,8 @@ export async function findDivergedBarBranch(issueId: string, projectDir: string)
   }
   for (const branch of branches.split('\n').map((b) => b.trim()).filter(Boolean)) {
     try {
-      const { stdout } = await execFileAsync('git', ['ls-tree', '-r', '--name-only', branch, '--', `design/${issueId}/index.html`], { cwd: projectDir })
+      const paths = ['index.html', ...MOCKUP_IMAGE_EXTENSIONS.map((ext) => `index${ext}`)].map((f) => `design/${issueId}/${f}`)
+      const { stdout } = await execFileAsync('git', ['ls-tree', '-r', '--name-only', branch, '--', ...paths], { cwd: projectDir })
       if (stdout.trim()) return branch
     } catch {
       // ls-tree failing for one candidate branch shouldn't abort checking
@@ -89,7 +131,11 @@ export async function findDivergedBarBranch(issueId: string, projectDir: string)
 // /snap/bin/chromium here) can only read/write under $HOME — no /tmp — and
 // reuses whatever --user-data-dir it's given, so every capture gets its own
 // scratch profile dir rather than sharing one across concurrent rounds.
-async function captureMockup(mockupHtml: string, out: string, [w, h]: [number, number], profileDir: string): Promise<void> {
+async function captureMockup(mockupPath: string, out: string, [w, h]: [number, number], profileDir: string): Promise<void> {
+  if (MOCKUP_IMAGE_EXTENSIONS.some((ext) => mockupPath.toLowerCase().endsWith(ext))) {
+    copyFileSync(mockupPath, out)
+    return
+  }
   mkdirSync(profileDir, { recursive: true })
   await execFileAsync(
     process.env.CHROMIUM_BIN || 'chromium-browser',
@@ -101,7 +147,7 @@ async function captureMockup(mockupHtml: string, out: string, [w, h]: [number, n
       `--user-data-dir=${profileDir}`,
       `--window-size=${w},${h}`,
       `--screenshot=${out}`,
-      `file://${mockupHtml}`,
+      `file://${mockupPath}`,
     ],
     { timeout: 60_000 },
   )
@@ -115,6 +161,56 @@ async function captureOurs(projectDir: string, cfg: CaptureConfig, params: Recor
     timeout: cfg.timeoutMs ?? 300_000,
     env: cfg.env ? { ...process.env, ...cfg.env } : process.env,
   })
+}
+
+// Only for domInspectable projects (see verifyStep's geometry branch).
+// cfg.serveCommand does the same build+serve setup as cfg.command but prints
+// a live URL instead of screenshotting — extract.ts's puppeteer then does one
+// navigation to that URL for both the screenshot and the DOM walk, so what
+// gets measured and what gets pictured can never drift apart. The spawned
+// serve process is killed once that single page load finishes, regardless
+// of outcome — it would otherwise sit there serving forever.
+async function captureAndExtractOurs(
+  projectDir: string,
+  cfg: CaptureConfig,
+  params: Record<string, string>,
+  viewport: [number, number],
+  screenshotPath: string,
+): Promise<ExtractedElement[]> {
+  if (!cfg.serveCommand) throw new Error('project has no serveCommand configured — geometry-based verification needs one')
+  const substitute = (arg: string) => arg.replace(/\{(\w+)\}/g, (_, key: string) => params[key] ?? '')
+  const [bin, ...rest] = cfg.serveCommand.map(substitute)
+  const proc = spawn(bin, rest, {
+    cwd: projectDir,
+    env: cfg.env ? { ...process.env, ...cfg.env } : process.env,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+
+  try {
+    const url = await new Promise<string>((resolvePromise, rejectPromise) => {
+      let buf = ''
+      const timer = setTimeout(() => rejectPromise(new Error('serveCommand did not print a URL within the timeout')), cfg.timeoutMs ?? 300_000)
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        buf += chunk.toString()
+        const line = buf.split('\n').find((l) => l.trim().startsWith('http'))
+        if (line) {
+          clearTimeout(timer)
+          resolvePromise(line.trim())
+        }
+      })
+      proc.on('error', (err) => {
+        clearTimeout(timer)
+        rejectPromise(err)
+      })
+      proc.on('exit', (code) => {
+        clearTimeout(timer)
+        rejectPromise(new Error(`serveCommand exited early (code ${code}) before printing a URL`))
+      })
+    })
+    return await extractElementsAndScreenshot(url, viewport, screenshotPath)
+  } finally {
+    proc.kill('SIGTERM')
+  }
 }
 
 // Exit code 0 with a blank or missing PNG is exactly the "trust the exit
@@ -321,4 +417,288 @@ export async function runCritique({
   })
 
   return takeVerdict(critiqueId) ?? extractVerdictFromText(searchable)
+}
+
+// The general-purpose sibling of the visual critic above: checks one step's
+// criterion against the real repo instead of two screenshots against each
+// other. `infra` must mean exactly "this attempt tells us nothing" (bad
+// command, timeout, no verdict at all) — never treated as a pass or a fail,
+// since either would burn or clear a step's attempt count on pure noise.
+export type StepVerdict = { kind: 'checked'; pass: boolean; detail: string } | { kind: 'infra'; detail: string }
+
+async function gitHeadAndStatus(projectDir: string): Promise<{ head: string; porcelain: string } | null> {
+  try {
+    const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: projectDir })
+    const { stdout: porcelain } = await execFileAsync('git', ['status', '--porcelain'], { cwd: projectDir })
+    return { head: head.trim(), porcelain: porcelain.trim() }
+  } catch {
+    return null
+  }
+}
+
+// Same in-flight/first-write-wins/text-fallback idioms as pendingVerdicts
+// above, kept as a separate map since a verify result and a visual verdict
+// are shaped differently and nothing should be able to answer the wrong one.
+const pendingVerifyResults = new Map<string, { pass: boolean; detail: string }>()
+
+export function recordVerifyResult(verifyId: string, result: { pass: boolean; detail: string }): boolean {
+  if (pendingVerifyResults.has(verifyId)) return false
+  pendingVerifyResults.set(verifyId, result)
+  return true
+}
+
+function takeVerifyResult(verifyId: string): { pass: boolean; detail: string } | undefined {
+  const v = pendingVerifyResults.get(verifyId)
+  pendingVerifyResults.delete(verifyId)
+  return v
+}
+
+const VERIFY_JSON_BLOCK = /\{[^{}]*"pass"\s*:\s*(true|false)[^{}]*"detail"\s*:\s*"((?:[^"\\]|\\.)*)"[^{}]*\}/i
+
+export function extractVerifyResultFromText(text: string): { pass: boolean; detail: string } | undefined {
+  const match = text.replace(BASH_SINGLE_QUOTE_ESCAPE, "'").match(VERIFY_JSON_BLOCK)
+  if (!match) return undefined
+  try {
+    const detail = JSON.parse(`"${match[2]}"`)
+    return typeof detail === 'string' && detail.trim() ? { pass: match[1] === 'true', detail: detail.trim() } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const DEFAULT_TOLERANCE = { position: 8, color: 12, fontSize: 1, borderRadius: 2 }
+
+function parseRgb(color: string): [number, number, number] | undefined {
+  const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : undefined
+}
+
+function colorsClose(a: string, b: string, tolerance: number): boolean {
+  const rgbA = parseRgb(a)
+  const rgbB = parseRgb(b)
+  if (!rgbA || !rgbB) return a === b
+  return rgbA.every((v, i) => Math.abs(v - rgbB[i]) <= tolerance)
+}
+
+function candidateLabel(c: ExtractedElement): string {
+  return c.text || c.dataMockupId || c.dataComponent || c.selector
+}
+
+// The AND-of-all-candidates replacement for "which is better, name one gap":
+// each candidate either matches a real implementation element within
+// tolerance or it doesn't — no holistic judgment, no single gap standing in
+// for everything else that might also be wrong. text match first (most
+// elements have a visible label), data-mockup-id/data-component as a
+// fallback only for candidates that need it (see buildDesignPrompt /
+// buildPrompt's carry-through rule) — never silently skips an unmatchable
+// candidate, that's exactly the kind of silent pass this whole mechanism
+// exists to prevent.
+async function verifyStepGeometry(
+  candidates: ExtractedElement[],
+  viewport: [number, number],
+  toleranceOverride: { position?: number; color?: number; fontSize?: number; borderRadius?: number } | undefined,
+  cfg: CaptureConfig,
+  params: Record<string, string>,
+  projectDir: string,
+  issueId: string,
+  round: number,
+): Promise<StepVerdict> {
+  const tolerance = { ...DEFAULT_TOLERANCE, ...toleranceOverride }
+  const roundDir = join(CRITIC_DIR, sanitizeForPath(issueId), String(round))
+  mkdirSync(roundDir, { recursive: true })
+
+  let ours: ExtractedElement[]
+  try {
+    ours = await captureAndExtractOurs(projectDir, cfg, params, viewport, join(roundDir, 'ours.png'))
+  } catch (err: any) {
+    return { kind: 'infra', detail: `geometry capture failed: ${err.message}` }
+  }
+
+  const used = new Set<number>()
+  for (const candidate of candidates) {
+    let matchIdx = -1
+    if (candidate.text) {
+      const ties = ours.map((el, i) => i).filter((i) => !used.has(i) && ours[i].text === candidate.text)
+      if (ties.length === 1) matchIdx = ties[0]
+      else if (ties.length > 1) {
+        matchIdx = ties.reduce((best, i) =>
+          Math.hypot(ours[i].box.x - candidate.box.x, ours[i].box.y - candidate.box.y) <
+          Math.hypot(ours[best].box.x - candidate.box.x, ours[best].box.y - candidate.box.y)
+            ? i
+            : best,
+        )
+      }
+    }
+    if (matchIdx < 0 && (candidate.dataMockupId || candidate.dataComponent)) {
+      matchIdx = ours.findIndex(
+        (el, i) =>
+          !used.has(i) &&
+          ((!!candidate.dataMockupId && el.dataMockupId === candidate.dataMockupId) ||
+            (!!candidate.dataComponent && el.dataComponent === candidate.dataComponent)),
+      )
+    }
+    if (matchIdx < 0) {
+      return { kind: 'checked', pass: false, detail: `no matching element found in the implementation for "${candidateLabel(candidate)}"` }
+    }
+    used.add(matchIdx)
+    const match = ours[matchIdx]
+    const label = candidateLabel(candidate)
+
+    const posOff =
+      Math.abs(match.box.x - candidate.box.x) > tolerance.position ||
+      Math.abs(match.box.y - candidate.box.y) > tolerance.position ||
+      Math.abs(match.box.width - candidate.box.width) > tolerance.position ||
+      Math.abs(match.box.height - candidate.box.height) > tolerance.position
+    if (posOff) {
+      return {
+        kind: 'checked',
+        pass: false,
+        detail: `"${label}" position/size off: expected {x:${candidate.box.x},y:${candidate.box.y},w:${candidate.box.width},h:${candidate.box.height}}, got {x:${match.box.x},y:${match.box.y},w:${match.box.width},h:${match.box.height}}`,
+      }
+    }
+    if (!colorsClose(match.style.backgroundColor, candidate.style.backgroundColor, tolerance.color)) {
+      return { kind: 'checked', pass: false, detail: `"${label}" background color off: expected ${candidate.style.backgroundColor}, got ${match.style.backgroundColor}` }
+    }
+    if (!colorsClose(match.style.color, candidate.style.color, tolerance.color)) {
+      return { kind: 'checked', pass: false, detail: `"${label}" text color off: expected ${candidate.style.color}, got ${match.style.color}` }
+    }
+    if (Math.abs(match.style.fontSize - candidate.style.fontSize) > tolerance.fontSize) {
+      return { kind: 'checked', pass: false, detail: `"${label}" font size off: expected ${candidate.style.fontSize}, got ${match.style.fontSize}` }
+    }
+    if (Math.abs(match.style.borderRadius - candidate.style.borderRadius) > tolerance.borderRadius) {
+      return { kind: 'checked', pass: false, detail: `"${label}" border radius off: expected ${candidate.style.borderRadius}, got ${match.style.borderRadius}` }
+    }
+  }
+
+  return { kind: 'checked', pass: true, detail: `all ${candidates.length} candidate(s) matched within tolerance` }
+}
+
+// check:'visual' -> the per-step opt-in sibling of the old whole-card
+// gauntlet: resolveBar's ok:false is now a LOUD infra failure (never the
+// silent "behave as if no bar exists" that let LAE-179 ship unverified) —
+// a step that asked for a visual check and can't get one must escalate, not
+// vanish. CaptureSideFailure (the app didn't build/launch/render) is the
+// Builder's own gap, so it's a real pass:false, not infra: an attempt is
+// burned and the failure feeds the next attempt's task, same as any other
+// checked failure.
+// command present -> mechanical, no LLM: exit 0 is pass, non-zero is a real
+// fail (burns an attempt), and anything that means the command never
+// meaningfully ran (missing binary, timeout) is infra (escalate, no attempt
+// burned) — same err.code-shape idiom as imagesAreIdentical above: a number
+// means the process ran and exited non-zero, anything else (string code like
+// ENOENT, or no code at all on a timeout kill) means it didn't.
+// command absent -> one fresh, read-only, MCP-less Claude turn, same
+// isolation shape as runCritique but scoped to the real project directory
+// (this critic needs repo access) instead of a screenshot-only scratch dir.
+export async function verifyStep(
+  step: {
+    criterion: string
+    command?: string
+    check?: 'visual'
+    visual?: {
+      mockup?: string
+      params?: Record<string, string>
+      candidates?: ExtractedElement[]
+      viewport?: [number, number]
+      tolerance?: { position?: number; color?: number; fontSize?: number; borderRadius?: number }
+    }
+    attempts: number
+  },
+  projectDir: string,
+  issueId: string,
+  onOutput?: (event: AgentEvent) => void,
+): Promise<StepVerdict> {
+  if (step.check === 'visual') {
+    const bar = resolveBar(issueId, projectDir, step)
+    if (!bar.ok) return { kind: 'infra', detail: bar.why }
+
+    if (step.visual?.candidates?.length && isDomInspectable(basename(projectDir))) {
+      return verifyStepGeometry(
+        step.visual.candidates,
+        step.visual.viewport ?? bar.cfg.viewport,
+        step.visual.tolerance,
+        bar.cfg,
+        bar.params,
+        projectDir,
+        issueId,
+        step.attempts + 1,
+      )
+    }
+
+    let capture: CaptureRoundResult
+    try {
+      capture = await captureRound(bar, projectDir, issueId, step.attempts + 1)
+    } catch (err: any) {
+      if (err instanceof CaptureSideFailure) return { kind: 'checked', pass: false, detail: err.message }
+      return { kind: 'infra', detail: err.message }
+    }
+
+    // Non-DOM-inspectable project (or a project step with no extracted
+    // candidates yet) — same holistic critic as before, but a candidate list
+    // (if the Refiner supplied one) turns "name the single biggest gap" into
+    // "here's a checklist" instead of nothing.
+    const hint = step.visual?.candidates?.length
+      ? `\n\nPay particular attention to these specific elements: ${step.visual.candidates.map(candidateLabel).join(', ')}.`
+      : ''
+    const verdict = await runCritique({
+      roundDir: capture.roundDir,
+      intent: step.criterion + hint,
+      onOutput: (event) => onOutput?.(event),
+    })
+    if (!verdict) return { kind: 'infra', detail: 'critic produced no verdict' }
+
+    const winnerIsMockup = (verdict.winner === 'A') === capture.mockupIsA
+    if (!winnerIsMockup) return { kind: 'checked', pass: true, detail: 'an independent visual critic, comparing blind, preferred the app over the mockup' }
+    return { kind: 'checked', pass: false, detail: verdict.gap }
+  }
+
+  if (step.command) {
+    try {
+      const { stdout, stderr } = await execFileAsync('bash', ['-lc', step.command], {
+        cwd: projectDir,
+        timeout: 600_000,
+        maxBuffer: 10 * 1024 * 1024,
+      })
+      return { kind: 'checked', pass: true, detail: (stdout + stderr).trim().slice(-2000) || 'command exited 0' }
+    } catch (err: any) {
+      if (typeof err.code === 'number') {
+        const output = `${err.stdout || ''}${err.stderr || ''}`.trim().slice(-2000)
+        return { kind: 'checked', pass: false, detail: output || `command exited ${err.code}` }
+      }
+      return { kind: 'infra', detail: err.message }
+    }
+  }
+
+  const verifyId = randomUUID()
+  const prompt = buildVerifyPrompt({ criterion: step.criterion, verifyId })
+  let searchable = ''
+  const before = await gitHeadAndStatus(projectDir)
+
+  await runClaude({
+    prompt,
+    projectDir,
+    onOutput: (event) => {
+      if (event.kind === 'text') searchable += event.text
+      else if (event.kind === 'tool_call' && event.tool === 'Bash' && event.input && typeof event.input === 'object' && 'command' in event.input) {
+        searchable += String((event.input as { command: unknown }).command)
+      }
+      onOutput?.(event)
+    },
+    session: { id: randomUUID(), resume: false },
+    readOnly: true,
+    noMcp: true,
+  })
+
+  const after = await gitHeadAndStatus(projectDir)
+  if (before && after && after.head !== before.head) {
+    return { kind: 'infra', detail: 'verifier moved HEAD during verification — discarding its verdict' }
+  }
+  const dirtyWarning =
+    before && after && after.porcelain !== before.porcelain
+      ? ` (note: verifier left the working tree dirty: ${after.porcelain.split('\n').slice(0, 5).join(', ')})`
+      : ''
+
+  const result = takeVerifyResult(verifyId) ?? extractVerifyResultFromText(searchable)
+  if (!result) return { kind: 'infra', detail: 'verifier produced no verdict' }
+  return { kind: 'checked', pass: result.pass, detail: `${result.detail}${dirtyWarning}` }
 }

@@ -1,5 +1,5 @@
 import React from 'react'
-import type { IdeationCandidate, IdeationSession, Project, SynthesisEntry } from '../types.ts'
+import type { ClaudeChoice, IdeationCandidate, IdeationSession, Project, SynthesisEntry } from '../types.ts'
 import { fetchSynthesis, generateSynthesis } from '../api.ts'
 import IdeationChat from './IdeationChat.tsx'
 import Markdown from './Markdown.tsx'
@@ -38,6 +38,7 @@ export default function IdeationView({
   onSend,
   onCreateCandidate,
   onDelete,
+  onChoiceChange,
 }: {
   sessions: Record<string, IdeationSession>
   selectedId: string | null
@@ -49,6 +50,7 @@ export default function IdeationView({
   onSend: (sessionId: string, message: string, images?: string[]) => void
   onCreateCandidate: (sessionId: string, candidate: IdeationCandidate, projectId: string) => Promise<void>
   onDelete: (sessionId: string) => void
+  onChoiceChange: (sessionId: string, choice: ClaudeChoice) => void
 }) {
   const [newProjectId, setNewProjectId] = React.useState('')
   const [synthesis, setSynthesis] = React.useState<SynthesisEntry | null>(null)
@@ -164,6 +166,8 @@ export default function IdeationView({
           running={running.has(selected.id)}
           onSend={(message, images) => onSend(selected.id, message, images)}
           onCreateCandidate={onCreateCandidate}
+          choice={{ model: selected.model, effort: selected.effort }}
+          onChoiceChange={(choice) => onChoiceChange(selected.id, choice)}
         />
       ) : (
         <p className="hint">Pick a discussion, or start a new one.</p>

@@ -1,4 +1,4 @@
-import type { Comment, Issue, IssueTransition, Project, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
+import type { Comment, FrictionEntry, Issue, IssueTransition, Plan, Project, StepAttempt, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -47,6 +47,10 @@ export function updateIssue(issueId: string, payload: { title?: string; descript
   })
 }
 
+export function fetchPlansForIssue(issueId: string): Promise<{ plans: Plan[] }> {
+  return request(`/api/plans?issueId=${encodeURIComponent(issueId)}`)
+}
+
 export function fetchComments(issueId: string): Promise<{ comments: Comment[] }> {
   return request(`/api/linear/issue/${issueId}/comments`)
 }
@@ -61,6 +65,14 @@ export function fetchIssueHistory(issueId: string): Promise<{ history: IssueTran
 
 export function fetchUsage(): Promise<{ entries: UsageEntry[] }> {
   return request('/api/usage')
+}
+
+export function fetchFriction(): Promise<{ entries: FrictionEntry[] }> {
+  return request('/api/friction')
+}
+
+export function fetchStepMetrics(): Promise<{ entries: StepAttempt[] }> {
+  return request('/api/step-metrics')
 }
 
 export function fetchSynthesis(projectId: string): Promise<{ synthesis: SynthesisEntry | null }> {

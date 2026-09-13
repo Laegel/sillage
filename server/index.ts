@@ -18,8 +18,10 @@ import {
   buildFullSynthesisPrompt,
   buildIncrementalSynthesisPrompt,
   buildRefineReadyRule,
-  CONSOLIDATE_PROMPT,
+  buildConsolidatePrompt,
   RESUME_RECAP_PROMPT,
+  parseClaudeChoice,
+  type ClaudeChoice,
   runClaude,
   runFree,
   runOpencode,
@@ -27,23 +29,27 @@ import {
   runMockAgent,
   SILLAGE_ROOT,
 } from './agent.ts'
-import { checkRequiredTools, resolveProjectDir } from './project-map.ts'
+import { captureConfigFor, checkRequiredTools, resolveProjectDir, supportsWorktrees } from './project-map.ts'
 import {
   captureRound,
   CaptureSideFailure,
   findDivergedBarBranch,
   recordVerdict,
+  recordVerifyResult,
   resolveBar,
   runCritique,
+  verifyStep,
   type BarResolution,
   type CaptureRoundResult,
   type Verdict,
 } from './critic.ts'
 import { deleteChatSession, getChatSession, saveChatSession, type ChatBackend } from './chat-store.ts'
-import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, type Plan } from './plans-store.ts'
+import { extractElements } from './extract.ts'
+import { appendStepAttempt, builderFailureReason, loadStepAttempts, modelFromRunLog, type StepAttempt } from './step-metrics-store.ts'
+import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, getActivePlanForIssue, setStep, type Plan, type Step } from './plans-store.ts'
 import { appendUsage, loadUsage } from './usage-store.ts'
 import { getSynthesis, saveSynthesis, type SynthesisEntry } from './synthesis-store.ts'
-import { classifyFriction, appendFriction } from './friction-store.ts'
+import { classifyFriction, appendFriction, loadFriction } from './friction-store.ts'
 import { loadActiveRuns, saveActiveRun, clearActiveRun, type RunBackend, type RunKind, type ActiveRunRecord } from './run-registry.ts'
 import type { AgentEvent, DriverAction, DriverActionKind, DriverMode, Issue } from './types.ts'
 
@@ -53,6 +59,11 @@ if (existsSync(envPath)) process.loadEnvFile(envPath)
 
 const PORT = Number(process.env.PORT || 4390)
 const linear = getLinearStore()
+
+// Step.command is LLM-authored and re-executed on every attempt (see the
+// per-step verify loop coming in Phase 2) — this is a coarse net, not a
+// sandbox; the real backstop is the human "Apply" gate before anything runs.
+const STEP_COMMAND_DENYLIST = /\b(git\s+(commit|push|checkout|reset)|gh\s+pr\s+(create|merge)|rm|mv|cp|tee|sudo|sed\s+-i|npm\s+publish|cargo\s+publish)\b/
 
 type ActiveState = {
   issueId: string
@@ -69,6 +80,34 @@ type ActiveState = {
 }
 
 const clients = new Set<WebSocket>()
+
+// One implement run at a time per project FOLDER (not per issue) — `active`
+// below only ever asked "is this issue running," never "is this project's
+// working tree already in use by a different issue." A project without git
+// worktrees (see supportsWorktrees) has exactly one checkout, so two implement
+// runs on two different issues in it would race on the same branch/files.
+// FIFO by construction: each acquire captures the current tail before
+// installing its own, so a third caller queues behind the second, not the
+// first. Skipped entirely for a project marked supportsWorktrees — see runTask.
+const projectSlot = new Map<string, Promise<void>>()
+
+async function acquireProjectSlot(folder: string, onOutput: (event: AgentEvent) => void): Promise<() => void> {
+  const waitFor = projectSlot.get(folder)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  projectSlot.set(folder, held)
+  if (waitFor) {
+    onOutput({ kind: 'orchestrator', text: 'Waiting — another issue is currently being implemented in this project; this run will start once it finishes.' })
+    await waitFor
+  }
+  return () => {
+    release()
+    if (projectSlot.get(folder) === held) projectSlot.delete(folder)
+  }
+}
+
 const active = new Map<string, ActiveState>()
 const activeRefine = new Map<string, { issueId: string; lastEventAt: number; textParts: string[]; events: AgentEvent[] }>()
 // Set by the refine agent itself via POST /api/refine/:issueId/ready when it
@@ -468,6 +507,8 @@ async function runTask({
   onOutput,
   onProcess,
   fresh,
+  openPr,
+  requireChanges,
 }: {
   issueId: string
   task: string
@@ -477,6 +518,14 @@ async function runTask({
   // run, e.g. when a prior attempt's session went off in a bad direction and
   // resuming it would just drag the same dead end back in.
   fresh?: boolean
+  // Threaded straight to buildPrompt — see its own comment for why this has
+  // to be a structural param, not a sentence in the task text.
+  openPr?: boolean
+  // false only for runCard's wrap-up run (see there) — that run's whole job
+  // is push + open PR, which legitimately makes no new commits when the last
+  // real step already committed everything, so "no changes" must not read
+  // as stuck for that one call.
+  requireChanges?: boolean
 }) {
   const issue = await linear.getIssue(issueId)
 
@@ -497,129 +546,136 @@ async function runTask({
   }
 
   const projectDir = resolveProjectDir(issue.project)
-  await checkRequiredTools(basename(projectDir))
-  const comments = await linear.listComments(issueId)
-  const approvedPlan = getLatestUnappliedPlanForIssue(issueId)
-  const planBlock = approvedPlan
-    ? `APPROVED PLAN\n${approvedPlan.content}\n\n`
-    : ''
-  const prompt = await buildPrompt({ issue, comments, task: `${planBlock}${task}`, projectDir })
-  onOutput({
-    kind: 'tool_call',
-    id: 'prompt',
-    tool: 'prompt',
-    label: `Prompt sent (${prompt.length} chars)`,
-    status: 'complete',
-    output: prompt,
-  })
+  const folder = basename(projectDir)
+  const releaseProjectSlot = supportsWorktrees(folder) ? undefined : await acquireProjectSlot(folder, onOutput)
 
-  // Keyed separately from refine's plain `issueId` key (chat-store.ts) — a
-  // refine turn's read-only session and an implement run's writing session
-  // for the same issue must never collide under one entry.
-  const sessionKey = `implement:${issueId}`
-  const existing = fresh ? undefined : getChatSession(sessionKey)
-
-  const before = await gitSnapshot(projectDir)
-  if (!before) {
-    onOutput({ kind: 'orchestrator', text: 'Could not read git status for this project — skipping the post-run change-verification check.' })
-  }
-
-  // No silent mock-agent fallback here on purpose: falling back to the demo mock when
-  // a real, configured agent fails would make it write a fabricated PR link and a real
-  // Linear status change for work that never happened — misleading, not helpful. The
-  // mock agent only ever runs when USE_MOCK_AGENT=true is explicitly set above; a real
-  // agent failing here is reported as a real failure instead.
-  let run: { exitCode: number | null; needsFallback: boolean; rateLimited?: boolean; sessionId?: string }
-  let backend: ChatBackend
-  let agentLabel: string
   try {
-    // Same resume-or-fresh dispatch runRefineTurn already uses (below) — a
-    // restart after a stalled/incomplete run resumes here instead of
-    // re-exploring the same files from scratch.
-    if (existing?.backend === 'claude') {
-      agentLabel = 'Claude Code (resumed session)'
-      backend = 'claude'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runClaude({
-        prompt,
-        projectDir,
-        onOutput,
-        session: { id: existing.sessionId, resume: true },
-        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
-      })
-    } else if (existing?.backend === 'opencode') {
-      agentLabel = 'OpenCode (resumed session)'
-      backend = 'opencode'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runOpencode({
-        prompt,
-        projectDir,
-        onOutput,
-        sessionId: existing.sessionId,
-        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
-      })
-    } else if (existing?.backend === 'kilocode') {
-      agentLabel = 'Kilo Code (resumed session)'
-      backend = 'kilocode'
-      onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-      run = await runKilocode({
-        prompt,
-        projectDir,
-        onOutput,
-        sessionId: existing.sessionId,
-        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
-      })
-    } else {
-      const agentChoice = await linear.resolveAgentChoice(issueId)
-      if (agentChoice === 'claude') {
-        agentLabel = 'Claude Code'
+    await checkRequiredTools(folder)
+    const comments = await linear.listComments(issueId)
+    const approvedPlan = getLatestUnappliedPlanForIssue(issueId)
+    const planBlock = approvedPlan
+      ? `APPROVED PLAN\n${approvedPlan.content}\n\n`
+      : ''
+    const prompt = await buildPrompt({ issue, comments, task: `${planBlock}${task}`, projectDir, openPr })
+    onOutput({
+      kind: 'tool_call',
+      id: 'prompt',
+      tool: 'prompt',
+      label: `Prompt sent (${prompt.length} chars)`,
+      status: 'complete',
+      output: prompt,
+    })
+
+    // Keyed separately from refine's plain `issueId` key (chat-store.ts) — a
+    // refine turn's read-only session and an implement run's writing session
+    // for the same issue must never collide under one entry.
+    const sessionKey = `implement:${issueId}`
+    const existing = fresh ? undefined : getChatSession(sessionKey)
+
+    const before = await gitSnapshot(projectDir)
+    if (!before) {
+      onOutput({ kind: 'orchestrator', text: 'Could not read git status for this project — skipping the post-run change-verification check.' })
+    }
+
+    // No silent mock-agent fallback here on purpose: falling back to the demo mock when
+    // a real, configured agent fails would make it write a fabricated PR link and a real
+    // Linear status change for work that never happened — misleading, not helpful. The
+    // mock agent only ever runs when USE_MOCK_AGENT=true is explicitly set above; a real
+    // agent failing here is reported as a real failure instead.
+    let run: { exitCode: number | null; needsFallback: boolean; rateLimited?: boolean; sessionId?: string }
+    let backend: ChatBackend
+    let agentLabel: string
+    try {
+      // Same resume-or-fresh dispatch runRefineTurn already uses (below) — a
+      // restart after a stalled/incomplete run resumes here instead of
+      // re-exploring the same files from scratch.
+      if (existing?.backend === 'claude') {
+        agentLabel = 'Claude Code (resumed session)'
         backend = 'claude'
-        const freshId = randomUUID()
         onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
         run = await runClaude({
           prompt,
           projectDir,
           onOutput,
-          session: { id: freshId, resume: false },
-          onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+          session: { id: existing.sessionId, resume: true },
+          onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
         })
-      } else {
-        agentLabel = 'Free (OpenCode, falling back to Kilo Code if needed)'
+      } else if (existing?.backend === 'opencode') {
+        agentLabel = 'OpenCode (resumed session)'
+        backend = 'opencode'
         onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
-        const freeRun = await runFree({
+        run = await runOpencode({
           prompt,
           projectDir,
           onOutput,
-          onProcess: (proc, logFile, freeBackend) => onProcess?.(proc, logFile, freeBackend, undefined),
+          sessionId: existing.sessionId,
+          onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
         })
-        run = freeRun
-        backend = freeRun.backend
+      } else if (existing?.backend === 'kilocode') {
+        agentLabel = 'Kilo Code (resumed session)'
+        backend = 'kilocode'
+        onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+        run = await runKilocode({
+          prompt,
+          projectDir,
+          onOutput,
+          sessionId: existing.sessionId,
+          onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
+        })
+      } else {
+        const agentChoice = await linear.resolveAgentChoice(issueId)
+        if (agentChoice === 'claude') {
+          agentLabel = 'Claude Code'
+          backend = 'claude'
+          const freshId = randomUUID()
+          onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+          run = await runClaude({
+            prompt,
+            projectDir,
+            onOutput,
+            session: { id: freshId, resume: false },
+            onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+          })
+        } else {
+          agentLabel = 'Free (OpenCode, falling back to Kilo Code if needed)'
+          onOutput({ kind: 'orchestrator', text: `Using ${agentLabel}.` })
+          const freeRun = await runFree({
+            prompt,
+            projectDir,
+            onOutput,
+            onProcess: (proc, logFile, freeBackend) => onProcess?.(proc, logFile, freeBackend, undefined),
+          })
+          run = freeRun
+          backend = freeRun.backend
+        }
+      }
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        throw new Error(`${agentLabel!} binary not found on this machine.`)
+      }
+      throw err
+    }
+
+    if (run.sessionId) saveChatSession(sessionKey, backend, run.sessionId)
+
+    if (run.needsFallback) {
+      if (run.rateLimited) {
+        throw new Error(`${agentLabel} hit OpenCode/Kilo Code's "Rate limit exceeded" error and could not finish. Wait for the quota to reset, or switch backend.`)
+      }
+      throw new Error(`${agentLabel} never finished — it either produced no output at all or went silent partway through. This can happen from an exhausted free-tier quota, an auth problem, or a crash; check the agent's own logs.`)
+    }
+
+    if (before && requireChanges !== false) {
+      const after = await gitSnapshot(projectDir)
+      if (after && after.head === before.head && !after.dirty) {
+        throw new Error(`${agentLabel} finished without making any file changes — it likely got stuck exploring or ran out of budget before implementing anything. Its session has been saved, so restarting will resume from here instead of re-exploring from scratch.`)
       }
     }
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      throw new Error(`${agentLabel!} binary not found on this machine.`)
-    }
-    throw err
+
+    return run
+  } finally {
+    releaseProjectSlot?.()
   }
-
-  if (run.sessionId) saveChatSession(sessionKey, backend, run.sessionId)
-
-  if (run.needsFallback) {
-    if (run.rateLimited) {
-      throw new Error(`${agentLabel} hit OpenCode/Kilo Code's "Rate limit exceeded" error and could not finish. Wait for the quota to reset, or switch backend.`)
-    }
-    throw new Error(`${agentLabel} never finished — it either produced no output at all or went silent partway through. This can happen from an exhausted free-tier quota, an auth problem, or a crash; check the agent's own logs.`)
-  }
-
-  if (before) {
-    const after = await gitSnapshot(projectDir)
-    if (after && after.head === before.head && !after.dirty) {
-      throw new Error(`${agentLabel} finished without making any file changes — it likely got stuck exploring or ran out of budget before implementing anything. Its session has been saved, so restarting will resume from here instead of re-exploring from scratch.`)
-    }
-  }
-
-  return run
 }
 
 // Joins a run's narrated text (kind:'text' events only — tool calls/status/
@@ -643,7 +699,9 @@ function summarizeEvents(events: AgentEvent[]): string {
 // handleRestart), the .finally() below immediately launches a fresh attempt
 // for the same task — synchronously, right after active.delete(), so there's
 // no window for a stray 'start' message to race into the gap.
-type StartRunResult = { ok: boolean; message: string; exitCode?: number | null; summary?: string }
+// backend/logFile: whichever process actually ran last (after a free-tier
+// fallback or a restart) — step metrics record them per attempt.
+type StartRunResult = { ok: boolean; message: string; exitCode?: number | null; summary?: string; backend?: RunBackend; logFile?: string }
 
 // silent skips this function's own done/error/stopped broadcasts — used by
 // runGauntlet, which drives multiple attempts per issue and must control
@@ -652,18 +710,29 @@ type StartRunResult = { ok: boolean; message: string; exitCode?: number | null; 
 // silenced — it has no OWNERSHIP_TRIGGER_REASONS entry, so it only ever
 // affects the live UI, where showing "a new round started" for each retry is
 // correct, not noise.
-function startRun(issueId: string, task: string, onDone?: (result: StartRunResult) => void, fresh?: boolean, silent?: boolean) {
+function startRun(
+  issueId: string,
+  task: string,
+  onDone?: (result: StartRunResult) => void,
+  fresh?: boolean,
+  silent?: boolean,
+  openPr?: boolean,
+  requireChanges?: boolean,
+) {
   const state: ActiveState = { issueId, task, events: [], done: false, proc: null, stopped: false, pendingRestart: false, lastEventAt: Date.now() }
   active.set(issueId, state)
 
   // Recorded here rather than calling onDone directly in .then()/.catch() —
   // see the contract note in .finally() below.
   let outcome: StartRunResult | null = null
+  let spawned: { backend: RunBackend; logFile: string } | undefined
 
   runTask({
     issueId,
     task,
     fresh,
+    openPr,
+    requireChanges,
     onOutput: (event) => {
       state.events.push(event)
       state.lastEventAt = Date.now()
@@ -672,6 +741,7 @@ function startRun(issueId: string, task: string, onDone?: (result: StartRunResul
     onProcess: (proc, logFile, backend, sessionId) => {
       state.proc = proc
       state.pid = proc.pid
+      spawned = { backend, logFile }
       registerRun(issueId, 'task', backend, sessionId, proc, logFile)
     },
   })
@@ -708,9 +778,9 @@ function startRun(issueId: string, task: string, onDone?: (result: StartRunResul
       // stopped path above never sets it), so it resolves with an explicit
       // "stopped before completion" rather than silently never settling.
       if (state.pendingRestart) {
-        startRun(issueId, state.task, onDone, undefined, silent)
+        startRun(issueId, state.task, onDone, undefined, silent, openPr, requireChanges)
       } else {
-        onDone?.(outcome ?? { ok: false, message: 'run was stopped before it completed' })
+        onDone?.({ ...(outcome ?? { ok: false, message: 'run was stopped before it completed' }), ...spawned })
       }
     })
 
@@ -898,6 +968,236 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
   })()
 }
 
+// Cap is per-step, not per-card — a card with 6 steps gets up to 6*3 = 18
+// attempts total, bounded by the 8-step max enforced at plan-creation time
+// (POST /api/plans), same reasoning as MAX_GAUNTLET_ROUNDS above but scoped
+// one level finer.
+const MAX_STEP_ATTEMPTS = 3
+
+function runCardAttempt(issueId: string, task: string, fresh: boolean | undefined, openPr: boolean, requireChanges: boolean): Promise<StartRunResult> {
+  return new Promise((resolve) => startRun(issueId, task, resolve, fresh, true, openPr, requireChanges))
+}
+
+// Frames one step as its own self-contained task — "step N of M" plus the
+// criterion restated as a DONE condition (not a to-do description) keeps the
+// resumed session from re-litigating steps already marked done, and the
+// verbatim lastFailure gives a retry the exact reason the previous attempt
+// didn't pass instead of making it re-derive that from scratch.
+function buildStepTask(step: Step, index: number, total: number): string {
+  const commandBlock = step.command
+    ? `\n\nYou can check your own work with this command — it should exit 0 once this step is genuinely done:\n${step.command}`
+    : ''
+  const failureBlock = step.lastFailure
+    ? `\n\nThe previous attempt at this step did NOT pass verification. What was found:\n${step.lastFailure}`
+    : ''
+  return `This is step ${index} of ${total} in a multi-step plan for this card. Earlier steps are already verified done — do not redo or second-guess them, only do this one.
+
+STEP: ${step.title}
+
+This step is DONE when: ${step.criterion}${commandBlock}${failureBlock}`
+}
+
+const STEPS_BLOCK_START = '<!-- steps:start -->'
+const STEPS_BLOCK_END = '<!-- steps:end -->'
+
+// Server-side twin of the frontend's own mergeStepsIntoDescription
+// (App.tsx) — same marker-delimited block, same regex-replace-or-append, so
+// either side can update just the checklist without clobbering the rest of
+// a human-editable field that updateIssue itself blind-overwrites.
+function mergeStepsIntoDescription(description: string, steps: Step[]): string {
+  const checklist = steps.map((s) => `- [${s.status === 'done' ? 'x' : ' '}] ${s.title} — ${s.criterion}`).join('\n')
+  const block = `${STEPS_BLOCK_START}\n## Steps\n${checklist}\n${STEPS_BLOCK_END}`
+  const pattern = new RegExp(`${STEPS_BLOCK_START}[\\s\\S]*?${STEPS_BLOCK_END}`)
+  if (pattern.test(description)) return description.replace(pattern, block)
+  const separator = description.trim() ? '\n\n' : ''
+  return `${description}${separator}${block}`
+}
+
+// Called unconditionally at the start of every runCard invocation — the
+// guarantee this exists for. If the description has never been merged
+// before (no marker block yet), the plan's own consolidated content becomes
+// the base, so a card that skipped Apply entirely (the actual LAE-177 bug)
+// still ends up with its real goal/approach text, not just a checklist
+// grafted onto nothing. Once a block exists, later calls preserve whatever's
+// currently in Linear (including a human's own edits) and only refresh the
+// checklist itself — never re-inject plan.content over something someone
+// may have since changed by hand.
+async function ensureDescriptionHasSteps(issueId: string, plan: Plan): Promise<void> {
+  if (!plan.steps || plan.steps.length === 0) return
+  const issue = await linear.getIssue(issueId)
+  const current = issue.description || ''
+  const hasBlock = new RegExp(`${STEPS_BLOCK_START}[\\s\\S]*?${STEPS_BLOCK_END}`).test(current)
+  const base = hasBlock ? current : plan.content || current
+  const merged = mergeStepsIntoDescription(base, plan.steps)
+  if (merged !== current) {
+    await linear.updateIssue(issueId, { description: merged })
+    broadcast({ type: 'issue_updated', issueId })
+  }
+}
+
+// Replaces runGauntlet at both call sites for any card Refine has split into
+// steps (see the "Per-step Builder→Critic loop" plan) — a card with no steps
+// falls straight through to the unchanged visual-gauntlet-or-plain-implement
+// behavior below, so un-refined work is never blocked on this being wired up.
+// Same onDone-fires-once contract as startRun/runGauntlet: exactly one
+// done/error broadcast for the whole call, regardless of how many step
+// attempts happened inside it — every attempt runs silent for exactly that
+// reason (see startRun's own comment on `silent`).
+function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean; message: string }) => void, fresh?: boolean): void {
+  const plan = getActivePlanForIssue(issueId)
+  if (!plan?.steps || plan.steps.length === 0) {
+    runGauntlet(issueId, task, onDone, fresh)
+    return
+  }
+  const steps = plan.steps
+
+  ;(async () => {
+    let projectDir: string
+    try {
+      const issue = await linear.getIssue(issueId)
+      projectDir = resolveProjectDir(issue.project)
+    } catch (err: any) {
+      broadcast({ type: 'error', issueId, message: err.message })
+      onDone?.({ ok: false, message: err.message })
+      return
+    }
+
+    // The Linear description is only ever written by a human clicking "Apply"
+    // in the frontend — nothing here required that to have happened. A card
+    // can reach runCard via the Driver, a raw start message, or a resumed
+    // session with the description still blank or stale (confirmed live:
+    // LAE-177 ran 3 real attempts with an empty description the whole time).
+    // Guarantee it here instead, unconditionally, every time real step work
+    // is about to begin — not optional, not skippable.
+    try {
+      await ensureDescriptionHasSteps(issueId, plan)
+    } catch (err: any) {
+      broadcast({ type: 'output', issueId, event: { kind: 'orchestrator', text: `Could not update the issue description with its step checklist: ${err.message}` } })
+    }
+
+    let usedFresh = false
+
+    // Step metrics (step-metrics-store.ts): one row per attempt, so whether
+    // this loop works can be judged from data. Never allowed to break the loop.
+    const record = (row: Omit<StepAttempt, 'timestamp' | 'issueId' | 'planId' | 'stepCount'>) => {
+      try {
+        appendStepAttempt({ timestamp: new Date().toISOString(), issueId, planId: plan.planId, stepCount: steps.length, ...row })
+      } catch (err: any) {
+        console.error(`[runCard ${issueId}] step metrics write failed:`, err.message)
+      }
+    }
+    const agentOf = (result: StartRunResult) => ({ backend: result.backend, model: modelFromRunLog(result.backend, result.logFile) })
+
+    for (const step of steps) {
+      if (step.status === 'done') continue // already verified in a prior runCard call
+
+      while (true) {
+        const stepFresh = usedFresh ? undefined : fresh
+        usedFresh = true
+
+        const builderStartedAt = Date.now()
+        const result = await runCardAttempt(issueId, buildStepTask(step, steps.indexOf(step) + 1, steps.length), stepFresh, false, true)
+        const attemptRow = {
+          phase: 'step' as const,
+          stepId: step.id,
+          stepTitle: step.title,
+          stepIndex: steps.indexOf(step) + 1,
+          attempt: step.attempts + 1,
+          ...agentOf(result),
+          builderMs: Date.now() - builderStartedAt,
+        }
+        if (!result.ok) {
+          record({ ...attemptRow, outcome: 'builder_failed', builderFailure: builderFailureReason(result.message), builderDetail: result.message })
+          // Crash, rate limit, or an external stop — same reasoning as
+          // runGauntlet's identical branch: nothing to verify yet, no
+          // attempt burned.
+          broadcast({ type: 'error', issueId, message: result.message, summary: result.summary })
+          onDone?.(result)
+          return
+        }
+
+        broadcast({ type: 'output', issueId, event: { kind: 'orchestrator', text: `Verifying step "${step.title}"…` } })
+        const checkStartedAt = Date.now()
+        const verdict = await verifyStep(step, projectDir, issueId, (event) => broadcast({ type: 'output', issueId, event }))
+        // Same precedence verifyStep itself uses: visual, then command, then the verifier.
+        const checkedRow = {
+          ...attemptRow,
+          checkMs: Date.now() - checkStartedAt,
+          checker: step.check === 'visual' ? ('visual' as const) : step.command ? ('command' as const) : ('verifier' as const),
+          verdictDetail: verdict.detail,
+        }
+
+        if (verdict.kind === 'infra') {
+          record({ ...checkedRow, verdict: 'infra', outcome: 'check_infra' })
+          // The check itself didn't run (missing binary, timeout, no verdict
+          // from the critic) — this says nothing about whether the step is
+          // actually done, so it must never burn an attempt or read as a fail.
+          const message = `Could not verify step "${step.title}": ${verdict.detail}`
+          await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-infra failed:`, err.message))
+          broadcast({ type: 'error', issueId, message })
+          onDone?.({ ok: false, message })
+          return
+        }
+
+        step.attempts += 1
+        step.lastFailure = verdict.pass ? undefined : verdict.detail
+        setStep(plan.planId, step.id, { attempts: step.attempts, lastFailure: step.lastFailure })
+        record({
+          ...checkedRow,
+          verdict: verdict.pass ? 'pass' : 'fail',
+          outcome: verdict.pass ? 'passed' : step.attempts >= MAX_STEP_ATTEMPTS ? 'exhausted' : 'retrying',
+        })
+
+        if (verdict.pass) {
+          step.status = 'done'
+          setStep(plan.planId, step.id, { status: 'done' })
+          break
+        }
+
+        if (step.attempts >= MAX_STEP_ATTEMPTS) {
+          const doneCount = steps.filter((s) => s.status === 'done').length
+          const message = `Step "${step.title}" failed verification after ${MAX_STEP_ATTEMPTS} attempts and needs a human look. Criterion: ${step.criterion}\nLast failure: ${step.lastFailure}`
+          await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-exhaustion failed:`, err.message))
+          broadcast({ type: 'error', issueId, message, steps: { done: doneCount, total: steps.length, failedStep: step.title, lastFailure: step.lastFailure } })
+          onDone?.({ ok: false, message })
+          return
+        }
+        // Attempts remain — loop again on the SAME step, with lastFailure now
+        // feeding the next attempt's task via buildStepTask.
+      }
+    }
+
+    // Every step independently verified — only now is it safe to let a run
+    // open the PR (see buildPrompt's openPr comment for why not sooner).
+    broadcast({ type: 'output', issueId, event: { kind: 'orchestrator', text: 'All steps verified — opening the PR…' } })
+    const wrapUpStartedAt = Date.now()
+    const wrapUp = await runCardAttempt(
+      issueId,
+      'Every implementation step for this card is complete and has been independently verified. There is nothing left to build — push your commits and open the PR now (or update the existing one if you already opened it earlier), per your standing rules.',
+      undefined,
+      true,
+      false,
+    )
+    record({
+      phase: 'wrap_up',
+      ...agentOf(wrapUp),
+      builderMs: Date.now() - wrapUpStartedAt,
+      outcome: wrapUp.ok ? 'passed' : 'builder_failed',
+      ...(wrapUp.ok ? {} : { builderFailure: builderFailureReason(wrapUp.message), builderDetail: wrapUp.message }),
+    })
+    if (!wrapUp.ok) {
+      const message = `All steps passed verification, but opening the PR failed: ${wrapUp.message}`
+      await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-wrapup failed:`, err.message))
+      broadcast({ type: 'error', issueId, message })
+      onDone?.({ ok: false, message })
+      return
+    }
+
+    broadcast({ type: 'done', issueId, exitCode: wrapUp.exitCode, summary: wrapUp.summary, steps: { done: steps.length, total: steps.length } })
+    onDone?.(wrapUp)
+  })()
+}
+
 function handleStart(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   const task = payload.task
@@ -910,7 +1210,7 @@ function handleStart(ws: WebSocket, payload: any) {
     return
   }
 
-  runGauntlet(issueId, task, undefined, Boolean(payload.fresh))
+  runCard(issueId, task, undefined, Boolean(payload.fresh))
   send(ws, { type: 'started', issueId })
 }
 
@@ -1040,34 +1340,22 @@ async function runRefineTurn({
       onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
     })
   } else {
-    const agentChoice = await linear.resolveAgentChoice(issueId)
-    if (agentChoice === 'claude') {
-      backend = 'claude'
-      const freshId = randomUUID()
-      run = await runClaude({
-        prompt,
-        projectDir,
-        onOutput,
-        session: { id: freshId, resume: false },
-        readOnly: true,
-        onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
-      })
-    } else {
-      // The session id negotiated by whichever free backend answers isn't known
-      // until it streams its first sessionID line (see attachOpencodeFamilyStream),
-      // well after this onProcess fires — registerRun below is fine with an
-      // initially-undefined sessionId, since a recovered run's tailer re-reads
-      // the whole log from byte 0 and re-derives it anyway.
-      const freeRun = await runFree({
-        prompt,
-        projectDir,
-        onOutput,
-        readOnly: true,
-        onProcess: (proc, logFile, freeBackend) => onProcess?.(proc, logFile, freeBackend, undefined),
-      })
-      run = freeRun
-      backend = freeRun.backend
-    }
+    // Brand-new refine sessions are always Claude, not resolveAgentChoice's usual
+    // free/Claude split: Refine now authors every step's acceptance criterion
+    // (see buildConsolidatePrompt), and consolidate resumes this exact session —
+    // an opencode session can't be resumed by Claude, so the split can't be
+    // deferred to later either. Existing opencode/kilocode refine sessions above
+    // keep resuming their own backend; only new sessions are affected.
+    backend = 'claude'
+    const freshId = randomUUID()
+    run = await runClaude({
+      prompt,
+      projectDir,
+      onOutput,
+      session: { id: freshId, resume: false },
+      readOnly: true,
+      onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
+    })
   }
 
   if (run.needsFallback) {
@@ -1089,9 +1377,16 @@ function runRefine(
   buildTurnPrompt: () => Promise<string> | string,
   onDone?: (result: { ok: boolean; message: string }) => void,
   isConsolidation = false,
+  // Set only for the consolidation the agent triggered itself via /ready: its
+  // posted plan is written straight to Linear (what the Refine panel's Apply
+  // button does), since nobody may be watching the draft box — a Driver-run
+  // refine otherwise never reached Linear at all (LAE-181, LAE-182). A manual
+  // "Consolidate" click still stops at the draft box for review.
+  autoApply = false,
 ): boolean {
   if (activeRefine.has(issueId)) return false
   activeRefine.set(issueId, { issueId, lastEventAt: Date.now(), textParts: [], events: [] })
+  const turnStartedAt = new Date().toISOString()
 
   ;(async () => {
     try {
@@ -1127,12 +1422,27 @@ function runRefine(
       // succeeded server-side, but the browser still showed no draft-plan box
       // because it missed the one-time "about to consolidate" message). Any
       // client connected by the time THIS message arrives gets the full fact.
-      broadcast({ type: 'refine_turn_done', issueId, summary: trimmedSummary, isConsolidation })
+      let autoApplied: 'applied' | 'no_plan' | undefined
+      if (autoApply) {
+        // Only a plan posted during this very turn — never an older one.
+        const plan = listPlansForIssue(issueId).find((p) => p.createdAt >= turnStartedAt)
+        if (plan) {
+          const description = plan.steps?.length ? mergeStepsIntoDescription(plan.content, plan.steps) : plan.content
+          await linear.updateIssue(issueId, { description })
+          await linear.setStatus(issueId, 'Todo')
+          broadcast({ type: 'issue_updated', issueId })
+          autoApplied = 'applied'
+        } else {
+          autoApplied = 'no_plan'
+        }
+      }
+      const consolidationQueued = refineReadyToConsolidate.has(issueId)
+      broadcast({ type: 'refine_turn_done', issueId, summary: trimmedSummary, isConsolidation, autoApplied, consolidationQueued })
       if (refineReadyToConsolidate.delete(issueId)) {
         // Deferred past this run's own `finally` (which hasn't executed yet —
         // we're still inside its `try` block) so the busy-check in runRefine
         // doesn't reject it as already-active.
-        queueMicrotask(() => runRefine(issueId, () => CONSOLIDATE_PROMPT, undefined, true))
+        queueMicrotask(() => runRefine(issueId, () => buildConsolidatePrompt(issueId), undefined, true, true))
       }
       onDone?.({ ok: true, message: trimmedSummary || 'refine turn complete (no text output)' })
     } catch (err: any) {
@@ -1156,7 +1466,8 @@ function handleRefineStart(ws: WebSocket, payload: any) {
     if (existing) return RESUME_RECAP_PROMPT
     const issue = await linear.getIssue(issueId)
     const projectDir = resolveProjectDir(issue.project)
-    return buildRefinePrompt({ issue, projectDir })
+    const comments = await linear.listComments(issueId)
+    return buildRefinePrompt({ issue, comments, projectDir })
   })
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
@@ -1172,7 +1483,7 @@ function handleRefineMessage(ws: WebSocket, payload: any) {
 function handleRefineConsolidate(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   if (!issueId) return send(ws, { type: 'error', message: 'issueId is required' })
-  const started = runRefine(issueId, () => CONSOLIDATE_PROMPT, undefined, true)
+  const started = runRefine(issueId, () => buildConsolidatePrompt(issueId), undefined, true)
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
 
@@ -1187,12 +1498,15 @@ async function runIdeationTurn({
   prompt,
   onOutput,
   onProcess,
+  choice,
 }: {
   sessionId: string
   projectId: string
   prompt: string
   onOutput: (event: AgentEvent) => void
   onProcess?: (proc: ChildProcess, logFile: string, backend: RunBackend, sessionId: string | undefined) => void
+  // Claude-only: an OpenCode/Kilo-resumed session keeps its server-wide model.
+  choice?: ClaudeChoice
 }) {
   const projectDir = resolveProjectDir(projectId)
   await checkRequiredTools(basename(projectDir))
@@ -1209,6 +1523,7 @@ async function runIdeationTurn({
       onOutput,
       session: { id: existing.sessionId, resume: true },
       readOnly: true,
+      choice,
       onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, existing.sessionId),
     })
   } else if (existing?.backend === 'opencode') {
@@ -1240,6 +1555,7 @@ async function runIdeationTurn({
       onOutput,
       session: { id: freshId, resume: false },
       readOnly: true,
+      choice,
       onProcess: (proc, logFile) => onProcess?.(proc, logFile, backend, freshId),
     })
   }
@@ -1257,7 +1573,7 @@ async function runIdeationTurn({
 // Mirrors runRefine(), against the separate activeIdeation map keyed by session id
 // (not issueId) — two different ideation sessions can run turns simultaneously
 // since they don't share a lock, but the same session can't have two in flight.
-function runIdeation(sessionId: string, projectId: string, buildTurnPrompt: () => Promise<string> | string): boolean {
+function runIdeation(sessionId: string, projectId: string, choice: ClaudeChoice, buildTurnPrompt: () => Promise<string> | string): boolean {
   if (activeIdeation.has(sessionId)) return false
   activeIdeation.set(sessionId, { sessionId, events: [] })
 
@@ -1269,6 +1585,7 @@ function runIdeation(sessionId: string, projectId: string, buildTurnPrompt: () =
         sessionId,
         projectId,
         prompt,
+        choice,
         onOutput: (event) => {
           activeIdeation.get(sessionId)?.events.push(event)
           broadcast({ type: 'ideation_output', sessionId, event })
@@ -1314,7 +1631,7 @@ function handleIdeationMessage(ws: WebSocket, payload: any) {
   if (!sessionId || !projectId || (!message.trim() && images.length === 0)) {
     return send(ws, { type: 'error', message: 'sessionId, projectId, and a message or image are required' })
   }
-  const started = runIdeation(sessionId, projectId, async () => {
+  const started = runIdeation(sessionId, projectId, parseClaudeChoice(payload), async () => {
     const paths = saveIdeationImages(sessionId, images)
     const imageNote = paths.length > 0 ? `\n\n[Attached image(s) — use the Read tool to view them before responding]\n${paths.map((p) => `- ${p}`).join('\n')}` : ''
     const existing = getChatSession(sessionId)
@@ -1438,6 +1755,13 @@ const OWNERSHIP_TRIGGER_REASONS: Record<string, (payload: any) => string> = {
   issue_updated: () => 'The card was updated (status/fields changed, possibly by hand).',
   pr_created: (p) => `A pull request was opened: ${p.prUrl}`,
   done: (p) => {
+    // runCard concluded a step-split card — every step was independently
+    // verified (not just "the run exited 0"), which is a stronger signal
+    // than the plain exit-code fallback below, so it replaces it entirely
+    // rather than adding to it.
+    if (p.steps) {
+      return `The implementation completed all ${p.steps.total} step(s) of its plan, each independently verified. Proceed on the card's own merits (review, PR, merge).`
+    }
     // A gauntlet concluded — this replaces the plain exit-code reason
     // entirely, not adds to it, because the whole point is that "exit code
     // 0" is not a trustworthy signal on its own for an issue with a design
@@ -1457,10 +1781,22 @@ const OWNERSHIP_TRIGGER_REASONS: Record<string, (payload: any) => string> = {
     p.summary
       ? `The run failed: ${p.message}\n\nWhat the agent said before failing:\n\n${p.summary}`
       : `The run failed: ${p.message}`,
-  refine_turn_done: (p) =>
-    p.summary
+  refine_turn_done: (p) => {
+    // A /ready-triggered consolidation writes Linear itself (see runRefine) —
+    // say so outright, or the Driver checks Linear too early and calls it lost.
+    if (p.autoApplied === 'applied') {
+      return `Refine consolidated the plan and it has been written to the issue: the description now holds the final plan with its steps, and the status moved to Todo. The card is ready to implement.`
+    }
+    if (p.consolidationQueued) {
+      return `The refine agent marked its plan ready. A consolidation turn is starting now: it writes the final description and steps, dry-runs each step's command, then writes the plan to Linear and moves the card to Todo — usually several minutes. Linear won't change before that finishes, so don't check it or retry yet; you'll get another update when it's done. What the agent said:\n\n${p.summary || '(no text output)'}`
+    }
+    if (p.autoApplied === 'no_plan') {
+      return `The refine agent marked its plan ready, but the consolidation turn posted no plan, so nothing was written to Linear. What it said:\n\n${p.summary || '(no text output)'}`
+    }
+    return p.summary
       ? `A refine discussion turn finished. Here's what the agent said:\n\n${p.summary}`
-      : 'A refine discussion turn finished with no text output — check the agent\'s own logs.',
+      : 'A refine discussion turn finished with no text output — check the agent\'s own logs.'
+  },
   stall_detected: (p) => `No activity for ${Math.round(p.thresholdMs / 1000)}s — may be stuck.`,
 }
 const BOARD_TRIGGER_TYPES = new Set(['issue_created', 'issue_updated'])
@@ -1551,7 +1887,8 @@ function parseDriverActions(text: string): DriverAction[] {
       if (typeof issueId !== 'string' || !issueId) continue
       const task = typeof (item as any).task === 'string' ? (item as any).task : undefined
       const reason = typeof (item as any).reason === 'string' ? (item as any).reason : undefined
-      actions.push({ action, issueId, task, reason })
+      const message = typeof (item as any).message === 'string' ? (item as any).message : undefined
+      actions.push({ action, issueId, task, reason, message })
     }
     return actions.slice(0, MAX_ACTIONS_PER_TURN)
   } catch {
@@ -1559,15 +1896,20 @@ function parseDriverActions(text: string): DriverAction[] {
   }
 }
 
-function startDriverRefine(issueId: string): Promise<{ ok: boolean; message: string }> {
+function startDriverRefine(issueId: string, message?: string): Promise<{ ok: boolean; message: string }> {
   return new Promise((resolve) => {
     const started = runRefine(
       issueId,
       async () => {
         const existing = getChatSession(issueId)
+        // A message only means something once there's an actual discussion to
+        // reply into — mirrors handleRefineMessage's own construction exactly,
+        // so the Refiner can't tell whether a human or the Driver sent it.
+        if (existing && message) return `${message}\n\n${buildRefineReadyRule(issueId)}`
         if (existing) return RESUME_RECAP_PROMPT
         const issue = await linear.getIssue(issueId)
-        return buildRefinePrompt({ issue, projectDir: resolveProjectDir(issue.project) })
+        const comments = await linear.listComments(issueId)
+        return buildRefinePrompt({ issue, comments, projectDir: resolveProjectDir(issue.project) })
       },
       resolve,
     )
@@ -1578,7 +1920,7 @@ function startDriverRefine(issueId: string): Promise<{ ok: boolean; message: str
 function startDriverImplement(issueId: string, task: string): Promise<{ ok: boolean; message: string }> {
   return new Promise((resolve) => {
     if (active.has(issueId)) return resolve({ ok: false, message: `${issueId} already has a run in progress — skipped.` })
-    runGauntlet(issueId, task, resolve)
+    runCard(issueId, task, resolve)
   })
 }
 
@@ -1710,7 +2052,7 @@ async function executeDriverActions(sessionId: string, projectId: string, action
     const result: { ok: boolean; message: string } = await (async () => {
       switch (action.action) {
         case 'refine':
-          return startDriverRefine(issueId)
+          return startDriverRefine(issueId, action.message)
         case 'implement':
           return action.task ? startDriverImplement(issueId, action.task) : { ok: false, message: 'implement action missing task' }
         case 'stop': {
@@ -1862,17 +2204,31 @@ function runDriver(sessionId: string, projectId: string, buildTurnPrompt: () => 
       broadcast({ type: 'error', sessionId, message: err.message })
       turnFailed = true
     } finally {
-      activeDriver.delete(sessionId)
       clearActiveRun(sessionId)
     }
-    if (turnFailed) return
+    if (turnFailed) {
+      activeDriver.delete(sessionId)
+      return
+    }
 
     const actions = parseDriverActions(assistantText)
     await executeDriverActions(sessionId, projectId, actions)
 
+    // Released only now, after the whole turn — LLM decision AND the actions
+    // it proposed — has actually finished, not right after the LLM call like
+    // before. That earlier release let a second ownership/board-scan event
+    // sail past flushDriverEvents' activeDriver.has() guard and fire an
+    // independent second turn while this one's own action (e.g. a real
+    // implement run via executeDriverActions) was still executing — the
+    // mechanism behind the Driver firing two Implementers on the same project
+    // at once. The per-project queue in runTask already makes that safe, but
+    // this stops the Driver from wastefully racing itself in the first place.
+    activeDriver.delete(sessionId)
+
     // Drain any ownership/board-scan events that queued up while this turn
     // was running (scheduleDriverEvent's debounce timer no-ops while activeDriver
-    // holds the lock).
+    // holds the lock — flushDriverEvents' own no-op guard needs the lock already
+    // released by this point, which is why this comes after the delete above).
     if (pendingDriverEvents.get(sessionId)?.length) {
       const timer = driverDebounceTimer.get(sessionId)
       if (timer) {
@@ -1952,6 +2308,7 @@ async function runDesignTurn({
   prompt,
   onOutput,
   onProcess,
+  choice,
 }: {
   sessionId: string
   projectId: string
@@ -1959,6 +2316,7 @@ async function runDesignTurn({
   prompt: string
   onOutput: (event: AgentEvent) => void
   onProcess?: (proc: ChildProcess, logFile: string, sessionId: string) => void
+  choice?: ClaudeChoice
 }) {
   const projectDir = resolveProjectDir(projectId)
   await checkRequiredTools(basename(projectDir))
@@ -1973,6 +2331,7 @@ async function runDesignTurn({
         onOutput,
         session: { id: existing.sessionId, resume: true },
         designDir,
+        choice,
         onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
       })
     : await runClaude({
@@ -1981,6 +2340,7 @@ async function runDesignTurn({
         onOutput,
         session: { id: freshId, resume: false },
         designDir,
+        choice,
         onProcess: (proc, logFile) => onProcess?.(proc, logFile, claudeSessionId),
       })
 
@@ -1992,7 +2352,7 @@ async function runDesignTurn({
 }
 
 // Mirrors runIdeation()/runDriver(), against the separate activeDesign map.
-function runDesign(sessionId: string, projectId: string, designDir: string, buildTurnPrompt: () => Promise<string> | string): boolean {
+function runDesign(sessionId: string, projectId: string, designDir: string, choice: ClaudeChoice, buildTurnPrompt: () => Promise<string> | string): boolean {
   if (activeDesign.has(sessionId)) return false
   activeDesign.set(sessionId, { sessionId, events: [] })
 
@@ -2005,6 +2365,7 @@ function runDesign(sessionId: string, projectId: string, designDir: string, buil
         projectId,
         designDir,
         prompt,
+        choice,
         onOutput: (event) => {
           activeDesign.get(sessionId)?.events.push(event)
           broadcast({ type: 'design_output', sessionId, event })
@@ -2034,13 +2395,15 @@ function handleDesignMessage(ws: WebSocket, payload: any) {
   }
   const issueId = designSessionIssue.get(sessionId)
   const designDir = resolveDesignDir(projectId, sessionId, issueId)
-  const started = runDesign(sessionId, projectId, designDir, async () => {
+  const started = runDesign(sessionId, projectId, designDir, parseClaudeChoice(payload), async () => {
     const paths = saveIdeationImages(sessionId, images)
     const imageNote = paths.length > 0 ? `\n\n[Attached image(s) — use the Read tool to view them before responding]\n${paths.map((p) => `- ${p}`).join('\n')}` : ''
     const existing = getChatSession(sessionId)
     if (existing) return `${message}${imageNote}`
     const issue = issueId ? await linear.getIssue(issueId) : undefined
-    const framing = buildDesignPrompt({ projectDir: resolveProjectDir(projectId), designDir, issue, synthesis: getSynthesis(projectId) })
+    const projectDir = resolveProjectDir(projectId)
+    const viewport = captureConfigFor(basename(projectDir))?.viewport
+    const framing = buildDesignPrompt({ projectDir, designDir, issue, synthesis: getSynthesis(projectId), viewport })
     return `${framing}\n\n---\n\nThe user's first message:\n${message}${imageNote}`
   })
   if (!started) rejectBusy(ws, { sessionId }, 'A turn is already running for this session')
@@ -2149,6 +2512,8 @@ const server = http.createServer(async (req, res) => {
     if (path === '/hook-event' && req.method === 'POST') return handleHookEvent(req, res)
     if (path.startsWith('/api/linear')) return handleLinearApi(req, res, path)
     if (path === '/api/usage' && req.method === 'GET') return json(res, 200, { entries: loadUsage() })
+    if (path === '/api/friction' && req.method === 'GET') return json(res, 200, { entries: loadFriction() })
+    if (path === '/api/step-metrics' && req.method === 'GET') return json(res, 200, { entries: loadStepAttempts() })
     const synthesisMatch = path.match(/^\/api\/synthesis\/([^/]+)(\/generate)?$/)
     if (synthesisMatch) {
       const [, projectId, generate] = synthesisMatch
@@ -2191,6 +2556,47 @@ const server = http.createServer(async (req, res) => {
       if (!recordVerdict(critiqueId, { winner, gap })) return json(res, 404, { ok: false, error: 'unknown or already-answered critique' })
       return json(res, 200, { ok: true })
     }
+    const verifyResultMatch = path.match(/^\/api\/verify\/([^/]+)\/result$/)
+    if (verifyResultMatch && req.method === 'POST') {
+      const [, verifyId] = verifyResultMatch
+      const body = await readBody(req)
+      const pass = typeof body.pass === 'boolean' ? body.pass : null
+      const detail = typeof body.detail === 'string' ? body.detail.trim() : ''
+      if (pass === null || !detail) return json(res, 400, { ok: false, error: 'pass (boolean) and detail (non-empty string) are required' })
+      if (!recordVerifyResult(verifyId, { pass, detail })) return json(res, 404, { ok: false, error: 'unknown or already-answered verify' })
+      return json(res, 200, { ok: true })
+    }
+    // Throwaway debug route: exercises verifyStep standalone against a real
+    // saved step, before runCard (the actual loop) exists to call it.
+    const verifyStepMatch = path.match(/^\/api\/verify-step\/([^/]+)\/([^/]+)$/)
+    if (verifyStepMatch && req.method === 'POST') {
+      const [, issueId, stepId] = verifyStepMatch
+      const plan = getActivePlanForIssue(issueId)
+      const step = plan?.steps?.find((s) => s.id === stepId)
+      if (!step) return json(res, 404, { error: 'no active plan step found with that id for this issue' })
+      const issue = await linear.getIssue(issueId)
+      const projectDir = resolveProjectDir(issue.project)
+      const verdict = await verifyStep(step, projectDir, issueId)
+      return json(res, 200, { verdict })
+    }
+    // What the Refiner curls during consolidation to see real geometry
+    // instead of eyeballing a mockup — fully synchronous and deterministic,
+    // no agent-spawning/curl-callback dance needed (unlike runCritique,
+    // which needs that specifically because it needs an LLM's judgment).
+    const extractElementsMatch = path === '/api/extract-elements'
+    if (extractElementsMatch && req.method === 'POST') {
+      const body = await readBody(req)
+      const url = typeof body.url === 'string' ? body.url : ''
+      const viewport: [number, number] =
+        Array.isArray(body.viewport) && body.viewport.length === 2 ? [Number(body.viewport[0]), Number(body.viewport[1])] : [1280, 720]
+      if (!url) return json(res, 400, { error: 'url is required' })
+      try {
+        const elements = await extractElements(url, viewport)
+        return json(res, 200, { elements })
+      } catch (err: any) {
+        return json(res, 502, { error: `extraction failed: ${err.message}` })
+      }
+    }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {
       const [, planId, apply] = plansMatch
@@ -2200,12 +2606,95 @@ const server = http.createServer(async (req, res) => {
           const title = typeof body.title === 'string' ? body.title.trim() : undefined
           const content = typeof body.content === 'string' ? body.content.trim() : ''
           if (!content) return json(res, 400, { error: 'content is required' })
+          let steps: Step[] | undefined
+          if (body.steps !== undefined) {
+            if (!Array.isArray(body.steps) || body.steps.length < 1 || body.steps.length > 8) {
+              return json(res, 400, { error: 'steps must be an array of 1-8 items' })
+            }
+            for (const s of body.steps) {
+              if (!s || typeof s.id !== 'string' || !s.id.trim() || typeof s.title !== 'string' || !s.title.trim() || typeof s.criterion !== 'string' || !s.criterion.trim()) {
+                return json(res, 400, { error: 'each step requires non-empty id, title, and criterion' })
+              }
+              if (s.command !== undefined) {
+                if (typeof s.command !== 'string' || !s.command.trim()) {
+                  return json(res, 400, { error: 'step command, if present, must be a non-empty string' })
+                }
+                if (STEP_COMMAND_DENYLIST.test(s.command)) {
+                  return json(res, 400, { error: `step command is not allowed: "${s.command}"` })
+                }
+              }
+              if (s.check !== undefined && s.check !== 'visual') {
+                return json(res, 400, { error: 'step check, if present, must be "visual"' })
+              }
+              if (s.visual !== undefined) {
+                if (!s.visual || typeof s.visual !== 'object') {
+                  return json(res, 400, { error: 'step visual, if present, must be an object' })
+                }
+                if (s.visual.mockup !== undefined && (typeof s.visual.mockup !== 'string' || !s.visual.mockup.trim())) {
+                  return json(res, 400, { error: 'step visual.mockup, if present, must be a non-empty string' })
+                }
+                if (s.visual.params !== undefined) {
+                  if (!s.visual.params || typeof s.visual.params !== 'object' || Array.isArray(s.visual.params)) {
+                    return json(res, 400, { error: 'step visual.params, if present, must be an object of strings' })
+                  }
+                  if (Object.values(s.visual.params).some((v) => typeof v !== 'string')) {
+                    return json(res, 400, { error: 'step visual.params values must all be strings' })
+                  }
+                }
+                if (s.visual.candidates !== undefined) {
+                  if (!Array.isArray(s.visual.candidates) || s.visual.candidates.length === 0) {
+                    return json(res, 400, { error: 'step visual.candidates, if present, must be a non-empty array' })
+                  }
+                  for (const c of s.visual.candidates) {
+                    const box = c?.box
+                    if (!c || typeof c.selector !== 'string' || typeof c.text !== 'string' || !box || typeof box !== 'object' ||
+                      typeof box.x !== 'number' || typeof box.y !== 'number' || typeof box.width !== 'number' || typeof box.height !== 'number') {
+                      return json(res, 400, { error: 'each visual.candidates entry needs selector, text, and a box of {x,y,width,height} numbers' })
+                    }
+                  }
+                }
+                if (s.visual.viewport !== undefined) {
+                  if (!Array.isArray(s.visual.viewport) || s.visual.viewport.length !== 2 || s.visual.viewport.some((n: unknown) => typeof n !== 'number')) {
+                    return json(res, 400, { error: 'step visual.viewport, if present, must be [width, height] numbers' })
+                  }
+                }
+                if (s.visual.tolerance !== undefined) {
+                  if (!s.visual.tolerance || typeof s.visual.tolerance !== 'object' || Array.isArray(s.visual.tolerance)) {
+                    return json(res, 400, { error: 'step visual.tolerance, if present, must be an object' })
+                  }
+                  if (Object.values(s.visual.tolerance).some((v) => v !== undefined && typeof v !== 'number')) {
+                    return json(res, 400, { error: 'step visual.tolerance values must all be numbers' })
+                  }
+                }
+              }
+            }
+            steps = body.steps.map((s: any) => ({
+              id: s.id.trim(),
+              title: s.title.trim(),
+              criterion: s.criterion.trim(),
+              command: typeof s.command === 'string' ? s.command.trim() : undefined,
+              check: s.check === 'visual' ? 'visual' : undefined,
+              visual: s.visual
+                ? {
+                    mockup: typeof s.visual.mockup === 'string' ? s.visual.mockup.trim() : undefined,
+                    params: s.visual.params && typeof s.visual.params === 'object' ? s.visual.params : undefined,
+                    candidates: Array.isArray(s.visual.candidates) ? s.visual.candidates : undefined,
+                    viewport: Array.isArray(s.visual.viewport) ? (s.visual.viewport as [number, number]) : undefined,
+                    tolerance: s.visual.tolerance && typeof s.visual.tolerance === 'object' ? s.visual.tolerance : undefined,
+                  }
+                : undefined,
+              status: 'pending',
+              attempts: 0,
+            }))
+          }
+          const issueId = typeof body.issueId === 'string' ? body.issueId : undefined
           const plan = savePlan({
             title,
             content,
-            issueId: typeof body.issueId === 'string' ? body.issueId : undefined,
+            issueId,
             sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
             createdAt: new Date().toISOString(),
+            steps,
           })
           return json(res, 201, { plan })
         } catch (err: any) {
@@ -2369,6 +2858,24 @@ function resumeTask(record: ActiveRunRecord): void {
   broadcast({ type: 'task_started', issueId: record.key, task: state.task })
 
   ;(async () => {
+    // Recovery reattaches directly to an already-running process — it never
+    // goes through runTask, so it never acquires the per-project slot either.
+    // Without this, a run that survives a server restart holds no lock at
+    // all, and a new implement on the same project would race it exactly
+    // like the original bug, just triggered by a restart instead of the
+    // Driver. Best-effort: a Linear hiccup here shouldn't block recovering
+    // the run itself, just means this one instance goes unguarded.
+    let releaseProjectSlot: (() => void) | undefined
+    try {
+      const issue = await linear.getIssue(record.key)
+      const folder = basename(resolveProjectDir(issue.project))
+      if (!supportsWorktrees(folder)) {
+        releaseProjectSlot = await acquireProjectSlot(folder, (event) => broadcast({ type: 'output', issueId: record.key, event }))
+      }
+    } catch (err: any) {
+      console.error(`[task ${record.key}] could not resolve project for recovery lock:`, err.message)
+    }
+
     try {
       const result = await resumeTaskRun(record, (event) => {
         state.events.push(event)
@@ -2389,6 +2896,7 @@ function resumeTask(record: ActiveRunRecord): void {
       console.error(`[task ${record.key}] recovered run failed:`, err)
       broadcast({ type: 'error', issueId: record.key, message: err.message, summary: summarizeEvents(state.events) })
     } finally {
+      releaseProjectSlot?.()
       active.delete(record.key)
       clearActiveRun(record.key)
       if (state.pendingRestart) startRun(record.key, state.task)

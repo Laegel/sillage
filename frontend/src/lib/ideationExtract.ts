@@ -1,4 +1,4 @@
-import type { AgentEvent, IdeationCandidate } from '../types.ts'
+import type { AgentEvent, ChatMessage, IdeationCandidate } from '../types.ts'
 import { eventsToPlainText } from './agentEvents.ts'
 
 const JSON_BLOCK = /```json\s*([\s\S]*?)```/i
@@ -21,4 +21,17 @@ export function parseCandidates(events: AgentEvent[]): IdeationCandidate[] | nul
 
 export function stripJsonBlock(text: string): string {
   return text.replace(JSON_BLOCK, '').trim()
+}
+
+// Candidates are derived per-message and injected as a synthetic
+// ideation_candidates event into that specific message's own event list —
+// this makes the card render inline, right where it was proposed, and only
+// there, instead of once globally per session. Shared by Ideation and Design.
+export function withCandidateEvents(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    const candidates = parseCandidates(m.events)
+    if (!candidates) return m
+    const strippedEvents: AgentEvent[] = m.events.map((e) => (e.kind === 'text' ? { ...e, text: stripJsonBlock(e.text) } : e))
+    return { ...m, events: [...strippedEvents, { kind: 'ideation_candidates', candidates } as AgentEvent] }
+  })
 }

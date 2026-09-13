@@ -1,5 +1,5 @@
 import React from 'react'
-import { createIssue, fetchIssue, fetchIssues, fetchProjects, setIssueStatus, updateIssue } from './api.ts'
+import { createIssue, fetchIssue, fetchIssues, fetchPlansForIssue, fetchProjects, setIssueStatus, updateIssue } from './api.ts'
 import { useSocket } from './useSocket.ts'
 import IssueTracker from './components/IssueTracker.tsx'
 import TaskPanel from './components/TaskPanel.tsx'
@@ -9,8 +9,10 @@ import DriverView from './components/DriverView.tsx'
 import DesignView from './components/DesignView.tsx'
 import MetricsView from './components/MetricsView.tsx'
 import UsageView from './components/UsageView.tsx'
+import FrictionView from './components/FrictionView.tsx'
+import StepsView from './components/StepsView.tsx'
 import Toasts from './components/Toasts.tsx'
-import type { ChatMessage, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, StreamEntry, ToastMessage, WsMessage } from './types.ts'
+import type { ChatMessage, ClaudeChoice, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, Step, StreamEntry, ToastMessage, WsMessage } from './types.ts'
 import { appendEvent, eventsToPlainText } from './lib/agentEvents.ts'
 import { loadRefineHistory, saveRefineHistory, toRefineHistoryStore } from './lib/refineHistory.ts'
 import { loadIdeationSessions, saveIdeationSessions } from './lib/ideationHistory.ts'
@@ -18,6 +20,23 @@ import { loadDriverSessions, saveDriverSessions } from './lib/driverHistory.ts'
 import { loadDesignSessions, saveDesignSessions } from './lib/designHistory.ts'
 
 let toastSeq = 0
+
+const STEPS_BLOCK_START = '<!-- steps:start -->'
+const STEPS_BLOCK_END = '<!-- steps:end -->'
+
+// Mirrors a plan's steps into the description as native Linear checkboxes,
+// inside a marker-delimited block so a later re-merge (once Phase 3's loop
+// starts flipping step status) can replace just that block via regex —
+// updateIssue itself blind-overwrites the whole field, so this is what stands
+// between a status update and clobbering the rest of the description.
+function mergeStepsIntoDescription(description: string, steps: Step[]): string {
+  const checklist = steps.map((s) => `- [${s.status === 'done' ? 'x' : ' '}] ${s.title} — ${s.criterion}`).join('\n')
+  const block = `${STEPS_BLOCK_START}\n## Steps\n${checklist}\n${STEPS_BLOCK_END}`
+  const pattern = new RegExp(`${STEPS_BLOCK_START}[\\s\\S]*?${STEPS_BLOCK_END}`)
+  if (pattern.test(description)) return description.replace(pattern, block)
+  const separator = description.trim() ? '\n\n' : ''
+  return `${description}${separator}${block}`
+}
 
 // Pairs a piece of React state with a ref that's always kept in sync, so an
 // event handler that needs to read another event's just-written value
@@ -90,7 +109,7 @@ export default function App() {
   // preview has no other signal that the mockup file on disk just changed.
   const [designPreviewRefresh, setDesignPreviewRefresh] = React.useState<Record<string, number>>({})
   const [selectedDesignId, setSelectedDesignId] = React.useState<string | null>(null)
-  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'usage'>('project')
+  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'usage' | 'friction' | 'steps'>('project')
 
   React.useEffect(() => {
     saveRefineHistory(toRefineHistoryStore(refineChats, draftPlans))
@@ -508,10 +527,22 @@ export default function App() {
           // agent.ts) rather than tracked via a separate signal sent earlier:
           // any client connected by the time this specific message arrives has
           // everything it needs, with no earlier broadcast to have missed.
-          if (msg.isConsolidation) {
-            const list = refineChatsRef.current[issueId]
-            const lastEvents = list && list.length > 0 ? list[list.length - 1].events : undefined
-            setDraftPlans((prev) => ({ ...prev, [issueId]: lastEvents ? eventsToPlainText(lastEvents) : '' }))
+          // autoApplied: the server already wrote the plan to Linear (the
+          // /ready path) — there's nothing left to review, so no draft box.
+          if (msg.isConsolidation && !msg.autoApplied) {
+            // The consolidate turn's own chat reply is just narration ("Plan
+            // posted, cleaning up...") — buildConsolidatePrompt has the agent
+            // curl the actual plan (description + steps) to the server rather
+            // than say it in chat, so the real text has to be re-fetched, not
+            // scraped from the transcript.
+            fetchPlansForIssue(issueId)
+              .then(({ plans }) => {
+                if (plans.length === 0) return
+                const plan = plans[0]
+                const text = plan.steps && plan.steps.length > 0 ? mergeStepsIntoDescription(plan.content, plan.steps) : plan.content
+                setDraftPlans((prev) => ({ ...prev, [issueId]: text }))
+              })
+              .catch((err) => console.error(`failed to fetch consolidated plan for ${issueId}:`, err))
           }
           break
         }
@@ -795,8 +826,12 @@ export default function App() {
     send({ type: 'delete_session', sessionId })
   }
 
+  const handleIdeationChoice = (sessionId: string, choice: ClaudeChoice) => {
+    setIdeationSessions((prev) => (prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], ...choice } } : prev))
+  }
+
   const handleIdeationMessage = (sessionId: string, message: string, images?: string[]) => {
-    const projectId = ideationSessionsRef.current[sessionId]?.projectId
+    const { projectId, model, effort } = ideationSessionsRef.current[sessionId] ?? {}
     setIdeationSessions((prev) => {
       const session = prev[sessionId]
       if (!session) return prev
@@ -818,7 +853,7 @@ export default function App() {
         },
       }
     })
-    send({ type: 'ideation_message', sessionId, projectId, message, images })
+    send({ type: 'ideation_message', sessionId, projectId, message, images, model, effort })
   }
 
   const handleCreateCandidate = async (sessionId: string, candidate: IdeationCandidate, projectId: string) => {
@@ -917,8 +952,12 @@ export default function App() {
     send({ type: 'delete_session', sessionId, projectId })
   }
 
+  const handleDesignChoice = (sessionId: string, choice: ClaudeChoice) => {
+    setDesignSessions((prev) => (prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], ...choice } } : prev))
+  }
+
   const handleDesignMessage = (sessionId: string, message: string, images?: string[]) => {
-    const projectId = designSessionsRef.current[sessionId]?.projectId
+    const { projectId, model, effort } = designSessionsRef.current[sessionId] ?? {}
     setDesignSessions((prev) => {
       const session = prev[sessionId]
       if (!session) return prev
@@ -940,12 +979,23 @@ export default function App() {
         },
       }
     })
-    send({ type: 'design_message', sessionId, projectId, message, images })
+    send({ type: 'design_message', sessionId, projectId, message, images, model, effort })
   }
 
   const handleLinkDesignIssue = (sessionId: string, issueId: string) => {
     const projectId = designSessionsRef.current[sessionId]?.projectId
     send({ type: 'design_link_issue', sessionId, projectId, issueId })
+  }
+
+  // Both "+ New issue from design" and the Designer's proposed-issue card land
+  // here: file the issue, then link the draft so its mockup moves to
+  // design/<issueId>/ — the folder implement and the visual critic read.
+  const handleCreateDesignIssue = async (sessionId: string, candidate: IdeationCandidate) => {
+    const projectId = designSessionsRef.current[sessionId]?.projectId
+    const { issue } = await createIssue({ title: candidate.title, description: candidate.description, projectId })
+    upsertIssue(issue)
+    handleLinkDesignIssue(sessionId, issue.id)
+    addToast({ kind: 'success', title: `Created ${issue.id}`, body: `${issue.title} — mockup linked` })
   }
 
   const handleCommitDesign = (sessionId: string) => {
@@ -983,6 +1033,12 @@ export default function App() {
           </button>
           <button type="button" className={view === 'usage' ? 'active' : ''} onClick={() => setView('usage')}>
             Usage
+          </button>
+          <button type="button" className={view === 'friction' ? 'active' : ''} onClick={() => setView('friction')}>
+            Friction
+          </button>
+          <button type="button" className={view === 'steps' ? 'active' : ''} onClick={() => setView('steps')}>
+            Steps
           </button>
         </nav>
         <div className={`status-dot ${connected ? 'online' : 'offline'}`} title={connected ? 'orchestrator online' : 'orchestrator offline'}>
@@ -1023,6 +1079,7 @@ export default function App() {
             onSend={handleIdeationMessage}
             onCreateCandidate={handleCreateCandidate}
             onDelete={handleDeleteIdeation}
+            onChoiceChange={handleIdeationChoice}
           />
         )}
         {view === 'driver' && (
@@ -1056,10 +1113,14 @@ export default function App() {
             onLinkIssue={handleLinkDesignIssue}
             onCommit={handleCommitDesign}
             onDelete={handleDeleteDesign}
+            onChoiceChange={handleDesignChoice}
+            onCreateIssue={handleCreateDesignIssue}
           />
         )}
         {view === 'metrics' && <MetricsView issues={issues} projects={projects} columns={columns} />}
         {view === 'usage' && <UsageView />}
+        {view === 'friction' && <FrictionView />}
+        {view === 'steps' && <StepsView />}
       </main>
       {selected && (
         <TaskPanel
