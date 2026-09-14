@@ -8,9 +8,7 @@ import IdeationView from './components/IdeationView.tsx'
 import DriverView from './components/DriverView.tsx'
 import DesignView from './components/DesignView.tsx'
 import MetricsView from './components/MetricsView.tsx'
-import UsageView from './components/UsageView.tsx'
 import FrictionView from './components/FrictionView.tsx'
-import StepsView from './components/StepsView.tsx'
 import Toasts from './components/Toasts.tsx'
 import type { ChatMessage, ClaudeChoice, IdeationCandidate, IdeationSession, Issue, DriverMode, DriverSession, DesignSession, Project, Step, StreamEntry, ToastMessage, WsMessage } from './types.ts'
 import { appendEvent, eventsToPlainText } from './lib/agentEvents.ts'
@@ -109,7 +107,7 @@ export default function App() {
   // preview has no other signal that the mockup file on disk just changed.
   const [designPreviewRefresh, setDesignPreviewRefresh] = React.useState<Record<string, number>>({})
   const [selectedDesignId, setSelectedDesignId] = React.useState<string | null>(null)
-  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'usage' | 'friction' | 'steps'>('project')
+  const [view, setView] = React.useState<'project' | 'execution' | 'ideation' | 'driver' | 'design' | 'metrics' | 'friction'>('project')
 
   React.useEffect(() => {
     saveRefineHistory(toRefineHistoryStore(refineChats, draftPlans))
@@ -1031,14 +1029,8 @@ export default function App() {
           <button type="button" className={view === 'metrics' ? 'active' : ''} onClick={() => setView('metrics')}>
             Metrics
           </button>
-          <button type="button" className={view === 'usage' ? 'active' : ''} onClick={() => setView('usage')}>
-            Usage
-          </button>
           <button type="button" className={view === 'friction' ? 'active' : ''} onClick={() => setView('friction')}>
             Friction
-          </button>
-          <button type="button" className={view === 'steps' ? 'active' : ''} onClick={() => setView('steps')}>
-            Steps
           </button>
         </nav>
         <div className={`status-dot ${connected ? 'online' : 'offline'}`} title={connected ? 'orchestrator online' : 'orchestrator offline'}>
@@ -1117,10 +1109,8 @@ export default function App() {
             onCreateIssue={handleCreateDesignIssue}
           />
         )}
-        {view === 'metrics' && <MetricsView issues={issues} projects={projects} columns={columns} />}
-        {view === 'usage' && <UsageView />}
+        {view === 'metrics' && <MetricsView projects={projects} />}
         {view === 'friction' && <FrictionView />}
-        {view === 'steps' && <StepsView />}
       </main>
       {selected && (
         <TaskPanel

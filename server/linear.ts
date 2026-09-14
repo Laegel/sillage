@@ -1,6 +1,7 @@
 import { LinearClient, type Issue as SdkIssue, type WorkflowState } from '@linear/sdk'
 import type {
   AgentChoice,
+  FlowIssueBase,
   Comment,
   CreateIssueInput,
   Issue,
@@ -23,29 +24,26 @@ const AGENT_LABEL_MAP: Record<string, AgentChoice> = { Claude: 'claude', Free: '
 const AGENT_LABEL_NAMES = new Set(Object.keys(AGENT_LABEL_MAP))
 const DEFAULT_AGENT: AgentChoice = 'free'
 
-// listIssues() fans out 3-4 extra round trips per issue (state/milestone/
-// labels/children — see below); firing all of them for up to 100 issues at
-// once is up to ~400 concurrent requests, which is what produces the
-// intermittent "UnknownLinearError: Fetch failed" seen under load (e.g.
-// toggling Driver autonomous mode right after a cold cache, which calls
-// listIssues() fresh). Capping how many issues are processed at once bounds
-// the fan-out without changing the per-issue query shape.
-// ponytail: a fixed concurrency cap, not adaptive — raise it (or batch via a
-// GraphQL query that includes these fields directly) if 100-issue boards
-// still see this under normal conditions.
-const LINEAR_FANOUT_CONCURRENCY = 8
+// Linear's edge occasionally drops a request ("GraphQL Error (Code: 503) -
+// upstream connect error…", "Fetch failed") — three Driver turns failed on
+// exactly that in one afternoon. Those are safe to retry; a rate limit (retrying
+// only burns more of the hourly budget) or a real error (not found, invalid
+// input) is not.
+export function isTransientLinearError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  if (/rate limit/i.test(message)) return false
+  return /\b(502|503|504)\b|upstream connect|connection (termination|reset)|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(message)
+}
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length)
-  let next = 0
-  async function worker() {
-    while (next < items.length) {
-      const i = next++
-      results[i] = await fn(items[i])
+export async function withLinearRetry<T>(fn: () => Promise<T>, delaysMs: number[] = [1000, 3000]): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (attempt >= delaysMs.length || !isTransientLinearError(err)) throw err
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]))
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
-  return results
 }
 
 function toStatusName(state: WorkflowState | undefined): string {
@@ -61,6 +59,105 @@ async function mapLabels(issue: SdkIssue): Promise<IssueLabel[]> {
   const labels = await issue.labels({ first: 50 })
   const nodes = labels.nodes || labels
   return nodes.filter((l) => !AGENT_LABEL_NAMES.has(l.name)).map((l) => ({ name: l.name, color: l.color }))
+}
+
+// Plain properties on the SDK issue — no extra request. Missing ones stay absent.
+function issueDates(issue: SdkIssue): { createdAt: string; startedAt?: string; completedAt?: string; canceledAt?: string } {
+  return {
+    createdAt: issue.createdAt.toISOString(),
+    startedAt: issue.startedAt?.toISOString(),
+    completedAt: issue.completedAt?.toISOString(),
+    canceledAt: issue.canceledAt?.toISOString(),
+  }
+}
+
+// getIssue's mapping; listIssues uses mapRawIssue on the batched query. The
+// frontend swaps a list entry for getIssue's result on every issue_updated, so
+// the two must never diverge (linear.check.ts pins mapRawIssue's shape).
+async function mapIssue(issue: SdkIssue): Promise<Issue> {
+  return {
+    id: issue.identifier,
+    title: issue.title,
+    description: issue.description || '',
+    status: toStatusName(await issue.state),
+    url: issue.url,
+    branchName: issue.branchName,
+    updatedAt: issue.updatedAt,
+    ...issueDates(issue),
+    project: issue.projectId,
+    priority: issue.priority,
+    priorityLabel: issue.priorityLabel,
+    milestone: (await issue.projectMilestone)?.name,
+    labels: await mapLabels(issue),
+    isSubIssue: Boolean(issue.parentId),
+    hasSubIssues: await hasChildren(issue),
+  }
+}
+
+// The board list, in one GraphQL query per page instead of the SDK's 1 + ~3
+// requests per issue (state, labels, children, milestone). At 178 issues that
+// fan-out was ~555 requests per cold refresh, and every issue change drops the
+// cache — enough to hit Linear's 2,500/hour limit on 2026-09-14.
+const BOARD_PAGE_SIZE = 50
+const BOARD_QUERY = `query BoardIssues($first: Int!, $after: String) {
+  issues(first: $first, after: $after) {
+    nodes {
+      identifier title description url branchName priority priorityLabel
+      createdAt startedAt completedAt canceledAt updatedAt
+      state { name }
+      project { id }
+      projectMilestone { name }
+      parent { id }
+      labels(first: 20) { nodes { name color } }
+      children(first: 1) { nodes { id } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}`
+
+export interface RawBoardIssue {
+  identifier: string
+  title: string
+  description?: string | null
+  url: string
+  branchName: string
+  priority: number
+  priorityLabel: string
+  createdAt: string
+  startedAt?: string | null
+  completedAt?: string | null
+  canceledAt?: string | null
+  updatedAt: string
+  state?: { name: string } | null
+  project?: { id: string } | null
+  projectMilestone?: { name: string } | null
+  parent?: { id: string } | null
+  labels: { nodes: { name: string; color: string }[] }
+  children: { nodes: { id: string }[] }
+}
+
+// Same Issue shape (and key order) as mapIssue, from the raw query's nodes.
+export function mapRawIssue(node: RawBoardIssue): Issue {
+  return {
+    id: node.identifier,
+    title: node.title,
+    description: node.description || '',
+    status: node.state?.name ?? 'Backlog',
+    url: node.url,
+    branchName: node.branchName,
+    updatedAt: new Date(node.updatedAt),
+    createdAt: node.createdAt,
+    startedAt: node.startedAt ?? undefined,
+    completedAt: node.completedAt ?? undefined,
+    canceledAt: node.canceledAt ?? undefined,
+    project: node.project?.id,
+    priority: node.priority,
+    priorityLabel: node.priorityLabel,
+    milestone: node.projectMilestone?.name,
+    labels: node.labels.nodes.filter((l) => !AGENT_LABEL_NAMES.has(l.name)).map((l) => ({ name: l.name, color: l.color })),
+    isSubIssue: Boolean(node.parent),
+    hasSubIssues: node.children.nodes.length > 0,
+  }
 }
 
 async function hasChildren(issue: SdkIssue): Promise<boolean> {
@@ -100,28 +197,30 @@ export class LinearStore implements LinearStoreLike {
 
   constructor() {
     this.client = new LinearClient({ apiKey: process.env.LINEAR_API_KEY })
+    // Every SDK query — including the lazy getters on models it creates later —
+    // goes through the client's `_request`, so retrying there covers them all.
+    // Mutations are never retried: a 503 can arrive after Linear already applied one.
+    const sdk = this.client as unknown as { _request: (doc: string, vars?: Record<string, unknown>) => Promise<unknown> }
+    const request = sdk._request
+    sdk._request = (doc, vars) => (/^\s*mutation\b/.test(doc) ? request(doc, vars) : withLinearRetry(() => request(doc, vars)))
   }
 
   async listIssues(): Promise<Issue[]> {
     return this.withCache('issues:all', async () => {
-      const issues = await this.client.issues({ first: 100 })
-      const nodes = issues.nodes || issues
-      return mapWithConcurrency(nodes, LINEAR_FANOUT_CONCURRENCY, async (issue: SdkIssue) => ({
-        id: issue.identifier,
-        title: issue.title,
-        description: issue.description || '',
-        status: toStatusName(await issue.state),
-        url: issue.url,
-        branchName: issue.branchName,
-        updatedAt: issue.updatedAt,
-        project: issue.projectId,
-        priority: issue.priority,
-        priorityLabel: issue.priorityLabel,
-        milestone: (await issue.projectMilestone)?.name,
-        labels: await mapLabels(issue),
-        isSubIssue: Boolean(issue.parentId),
-        hasSubIssues: await hasChildren(issue),
-      }))
+      const issues: Issue[] = []
+      let after: string | undefined
+      do {
+        const response = await withLinearRetry(() =>
+          this.client.client.rawRequest<{ issues: { nodes: RawBoardIssue[]; pageInfo: { hasNextPage: boolean; endCursor?: string } } }, Record<string, unknown>>(
+            BOARD_QUERY,
+            { first: BOARD_PAGE_SIZE, after },
+          ),
+        )
+        const page = response.data!.issues
+        issues.push(...page.nodes.map(mapRawIssue))
+        after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : undefined
+      } while (after)
+      return issues
     })
   }
 
@@ -131,23 +230,40 @@ export class LinearStore implements LinearStoreLike {
       if (!issue) throw new Error(`Linear issue ${identifier} not found`)
       const parent = await issue.parent
       return {
-        id: issue.identifier,
-        title: issue.title,
-        description: issue.description || '',
-        status: toStatusName(await issue.state),
-        url: issue.url,
-        branchName: issue.branchName,
-        project: issue.projectId,
-        priority: issue.priority,
-        priorityLabel: issue.priorityLabel,
-        milestone: (await issue.projectMilestone)?.name,
-        labels: await mapLabels(issue),
-        isSubIssue: Boolean(issue.parentId),
-        hasSubIssues: await hasChildren(issue),
+        ...(await mapIssue(issue)),
         parent: parent
           ? { id: parent.identifier, title: parent.title, status: toStatusName(await parent.state), url: parent.url }
           : undefined,
       }
+    })
+  }
+
+  // Everything the Metrics page's flow charts need, for issues touched since
+  // `since` or still open. Only fields the issues query already returns —
+  // status comes from one cached workflow-state map, not a request per issue.
+  // includeArchived: Linear auto-archives old Done issues, which still count.
+  async listFlowIssues(since: Date): Promise<FlowIssueBase[]> {
+    const [nodes, states] = await Promise.all([
+      this.client.paginate(this.client.issues.bind(this.client), {
+        first: 100,
+        includeArchived: true,
+        filter: { or: [{ updatedAt: { gte: since } }, { completedAt: { null: true }, canceledAt: { null: true } }] },
+      }),
+      this.stateNames(),
+    ])
+    return nodes.map((issue) => ({
+      id: issue.identifier,
+      project: issue.projectId,
+      status: (issue.stateId && states.get(issue.stateId)) || 'Backlog',
+      ...issueDates(issue),
+      updatedAt: issue.updatedAt.toISOString(),
+    }))
+  }
+
+  private stateNames(): Promise<Map<string, string>> {
+    return this.withCache('workflow-states', async () => {
+      const states = await this.client.paginate(this.client.workflowStates.bind(this.client), { first: 100 })
+      return new Map(states.map((s) => [s.id, s.name]))
     })
   }
 
@@ -280,19 +396,21 @@ export class LinearStore implements LinearStoreLike {
     )
   }
 
+  // fromStateId/toStateId come with each history entry; resolving them through
+  // the cached state map avoids two WorkflowState requests per transition.
   async listIssueHistory(identifier: string): Promise<IssueTransition[]> {
     const issue = await this.client.issue(identifier)
     if (!issue) throw new Error(`Linear issue ${identifier} not found`)
-    const history = await issue.history({ first: 100 })
-    const nodes = history.nodes || history
-    const transitions: IssueTransition[] = []
-    for (const entry of nodes) {
-      const toState = await entry.toState
-      if (!toState) continue
-      const fromState = await entry.fromState
-      transitions.push({ fromStatus: fromState?.name, toStatus: toState.name, timestamp: entry.createdAt.toISOString() })
-    }
-    return transitions
+    const [nodes, states] = await Promise.all([
+      this.client.paginate(issue.history.bind(issue), { first: 100 }),
+      this.stateNames(),
+    ])
+    return nodes.flatMap((entry) => {
+      const toStatus = entry.toStateId && states.get(entry.toStateId)
+      if (!toStatus) return []
+      const fromStatus = (entry.fromStateId && states.get(entry.fromStateId)) || undefined
+      return [{ fromStatus, toStatus, timestamp: entry.createdAt.toISOString() }]
+    })
   }
 }
 
@@ -407,6 +525,10 @@ export class MockLinearStore implements LinearStoreLike {
 
   async listIssueHistory(): Promise<IssueTransition[]> {
     return []
+  }
+
+  async listFlowIssues(): Promise<FlowIssueBase[]> {
+    return [...this.issues.values()].map((i) => ({ id: i.id, project: i.project, status: i.status, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }))
   }
 }
 

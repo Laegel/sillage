@@ -12,15 +12,16 @@
   --red: #e5534b;
   --amber: #e2a13b;
   /* dataviz skill's validated dark-mode categorical slots (references/palette.md),
-     fixed order — never cycled/reassigned per project, indexed by stable project order */
+     in its slot ORDER — the order is what keeps neighbours distinguishable
+     (validate_palette.js passes on --panel-2). Indexed by stable project order. */
   --project-color-0: #3987e5;
-  --project-color-1: #199e70;
-  --project-color-2: #c98500;
-  --project-color-3: #008300;
-  --project-color-4: #9085e9;
-  --project-color-5: #e66767;
-  --project-color-6: #d55181;
-  --project-color-7: #d95926;
+  --project-color-1: #d95926;
+  --project-color-2: #199e70;
+  --project-color-3: #c98500;
+  --project-color-4: #d55181;
+  --project-color-5: #008300;
+  --project-color-6: #9085e9;
+  --project-color-7: #e66767;
 }
 
 * {
@@ -1109,42 +1110,194 @@ body {
   display: inline-block;
 }
 
+/* Metrics page — flow, agent loop and cost on one scrolling page. Chart marks
+   follow the dataviz skill: hairline grid, ≤24px bars, 2px lines, text in text
+   tokens (never the series colour). */
 .metrics-view {
   padding: 16px;
   overflow-y: auto;
+  transition: opacity 0.15s;
 }
 
-.metrics-stats {
+/* Hold the previous render while a new period loads — no layout jump. */
+.metrics-refreshing {
+  opacity: 0.55;
+}
+
+.metrics-filters {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 12px;
-  margin: 12px 0 20px;
+  margin-bottom: 16px;
 }
 
-.metrics-stat {
+.metrics-filters label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.metrics-filters select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.metrics-error {
+  color: var(--red);
+  font-size: 12px;
+}
+
+.metrics-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.metrics-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.metrics-tiles-compact {
+  margin-bottom: 16px;
+}
+
+.metrics-tile {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 10px 16px;
+  padding: 12px 16px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--panel-2);
 }
 
-.metrics-stat-value {
-  font-size: 20px;
+.metrics-tile-value {
+  font-size: 22px;
   font-weight: 600;
 }
 
-.metrics-stat-label {
+.metrics-tiles-compact .metrics-tile-value {
+  font-size: 18px;
+}
+
+.metrics-tile-label {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.metrics-tile-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.metrics-delta-good {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.metrics-delta-bad {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.metrics-section {
+  margin-bottom: 28px;
+}
+
+.metrics-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.metrics-section-title .metrics-muted {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  margin-left: 8px;
+}
+
+.metrics-muted {
+  color: var(--muted);
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+
+@media (min-width: 1100px) {
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.metrics-chart-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 12px 16px 14px;
+  min-width: 0;
+}
+
+.metrics-grid + .metrics-chart-card {
+  margin-top: 16px;
+}
+
+.metrics-chart-card h3 {
+  font-size: 14px;
+  color: var(--text);
+  margin: 0;
+}
+
+.metrics-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.metrics-card-sub {
   font-size: 12px;
   color: var(--muted);
+  margin-top: 2px;
+}
+
+.metrics-table-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.metrics-table-toggle:hover {
+  color: var(--text);
 }
 
 .metrics-legend {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
-  margin-bottom: 12px;
+  margin-bottom: 6px;
   font-size: 12px;
   color: var(--muted);
 }
@@ -1162,22 +1315,16 @@ body {
   flex-shrink: 0;
 }
 
-.metrics-chart-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel-2);
-  padding: 12px 16px 16px;
-  margin-bottom: 16px;
+.metrics-key-line {
+  display: inline-block;
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
 }
 
-.metrics-chart-card h3 {
-  font-size: 14px;
-  color: var(--muted);
-  margin: 0 0 8px;
-}
-
-.metrics-chart-scroll {
-  overflow-x: auto;
+.metrics-plot {
+  position: relative;
 }
 
 .metrics-chart-svg {
@@ -1189,27 +1336,24 @@ body {
   stroke-width: 1;
 }
 
+.metrics-baseline {
+  stroke: var(--muted);
+  stroke-opacity: 0.45;
+  stroke-width: 1;
+}
+
 .metrics-axis-label {
   font-size: 11px;
   fill: var(--muted);
-}
-
-.metrics-bar {
-  fill: var(--accent);
-  transition: filter 0.1s;
-}
-
-.metrics-bar:hover {
-  filter: brightness(1.2);
+  font-variant-numeric: tabular-nums;
 }
 
 .metrics-bar-label {
-  font-size: 12px;
+  font-size: 11px;
   fill: var(--text);
 }
 
 .metrics-line {
-  stroke: var(--accent);
   stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
@@ -1217,14 +1361,132 @@ body {
 }
 
 .metrics-dot {
-  fill: var(--accent);
   stroke: var(--panel-2);
   stroke-width: 2;
-  transition: filter 0.1s;
 }
 
-.metrics-dot:hover {
-  filter: brightness(1.2);
+.metrics-crosshair {
+  stroke: var(--muted);
+  stroke-opacity: 0.6;
+  stroke-width: 1;
+}
+
+/* Full week band: the hover target is the whole slot, not the painted mark. */
+.metrics-hit {
+  fill: transparent;
+}
+
+.metrics-hit:hover {
+  fill: rgba(255, 255, 255, 0.04);
+}
+
+.metrics-tooltip {
+  position: absolute;
+  pointer-events: none;
+  min-width: 150px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  z-index: 2;
+}
+
+.metrics-tooltip-title {
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.metrics-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.metrics-tooltip-row strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.metrics-table-scroll {
+  overflow-x: auto;
+}
+
+.metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.metrics-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.metrics-table td {
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.metrics-details summary {
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.metrics-subsection-title {
+  font-size: 14px;
+  color: var(--text);
+  margin: 16px 0 10px;
+}
+
+.metrics-grid-spaced {
+  margin-top: 16px;
+}
+
+.metrics-card-gap {
+  margin-top: 16px !important;
+}
+
+.metrics-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-2);
+  cursor: pointer;
+  font: inherit;
+}
+
+.metrics-row-selected td {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.friction-entry.metrics-attempt {
+  grid-template-columns: minmax(120px, max-content) minmax(110px, max-content) 1fr max-content;
+}
+
+.metrics-outcome {
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+
+.metrics-outcome-pass {
+  color: var(--green);
+}
+
+.metrics-outcome-retry {
+  color: var(--amber);
+}
+
+.metrics-outcome-fail {
+  color: var(--red);
 }
 
 .usage-view {
@@ -1277,69 +1539,13 @@ body {
   margin: 0 0 8px;
 }
 
-.usage-chart-scroll {
-  overflow-x: auto;
-}
 
-.usage-chart-svg {
-  display: block;
-}
 
-.usage-gridline {
-  stroke: var(--border);
-  stroke-width: 1;
-}
 
-.usage-axis-label {
-  font-size: 11px;
-  fill: var(--muted);
-}
 
-.usage-line {
-  display: flex;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--muted);
-  padding: 2px 0;
-}
 
 /* Friction panel — reuses .usage-view/.usage-stat/.usage-chart-card; these
    are only the pieces that view doesn't already have. */
-/* Steps panel — also reuses .usage-* and .friction-* pieces. */
-.steps-stats {
-  flex-wrap: wrap;
-}
-
-.friction-entry.steps-entry {
-  grid-template-columns: minmax(120px, max-content) minmax(110px, max-content) 1fr max-content;
-}
-
-.steps-outcome {
-  font-family: ui-monospace, monospace;
-  white-space: nowrap;
-}
-
-.steps-outcome-pass {
-  color: var(--green);
-}
-
-.steps-outcome-retry {
-  color: var(--amber);
-}
-
-.steps-outcome-fail {
-  color: var(--red);
-}
-
-.steps-detail {
-  color: var(--muted);
-}
-
-.steps-cell-name {
-  color: var(--text);
-  min-width: 180px;
-}
-
 .friction-stat {
   font: inherit;
   color: inherit;

@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import type { AgentEvent, Comment, Issue, DriverMode } from './types.ts'
 import type { SynthesisEntry } from './synthesis-store.ts'
+import { projectsRoot } from './project-map.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const SILLAGE_ROOT = join(__dirname, '..')
@@ -204,7 +205,17 @@ RULES FOR THIS DISCUSSION
 // this same kind of "also do X" instruction failed twice earlier (see the
 // refine-ready-signal history) while an instructed curl call has proven reliable
 // even for free-tier backends.
-export function buildConsolidatePrompt(issueId: string): string {
+// `captureParams`: the keys this project's capture command substitutes (see
+// project-map.ts captureParamNames), null when it has no capture command, or
+// undefined when the project couldn't be resolved. Named explicitly because a
+// refine agent left to guess wrote {"run": "<shell command>"} for LAE-183.
+export function buildConsolidatePrompt(issueId: string, captureParams?: string[] | null): string {
+  const captureRule =
+    captureParams === null
+      ? ` This project has no capture command configured, so there is no visual check available here — don't write "check":"visual" steps; use a "command" or leave the step to the verifier.`
+      : captureParams
+        ? ` This project's capture command takes exactly these params: ${captureParams.length ? captureParams.map((p) => `"${p}"`).join(', ') : '(none)'} — use exactly these keys, no others, each a plain string value (e.g. a scene name), never a shell command.`
+        : ''
   return `Based on our discussion so far, write a final, self-contained issue description that captures the agreed plan: the concrete goal, the approach, and any important constraints or decisions we made. Do not include meta-commentary about the discussion itself (no "we discussed" or "the user asked") — write it as the issue description should read on its own, ready for implementation. Do not write any code and do not touch git, GitHub, or Linear.
 
 If, while exploring, you identified specific existing symbols (functions, types, classes) that the implementation will need to read, extend, or reuse, add a "## Relevant symbols" section listing only the ones that actually matter (not everything you looked at), one per line, as: symbolName (path/to/file.ts) — why it matters. This lets a fresh implementation run jump straight to the right code via a symbol lookup instead of re-exploring the codebase from scratch. Omit the section entirely if nothing specific applies.
@@ -216,7 +227,7 @@ Each step needs:
 - "title": a short name for the step.
 - "criterion": what must be OBSERVABLY true when the step is done — something a third party can check without judgment, not something they have to judge. Bad: "Refactor panel sizing", "Panel looks right" (still a judgment call). Good: "Launching at 800x600 with inventory open shows the \`X / 20 slots\` counter fully inside the window."
 - "command" (optional): a shell command that exits 0 when the criterion holds. Include it whenever you can write one — use this ladder: (1) a test that currently fails and would pass once the step is done — write that test and put it here; (2) any other command with a checkable exit code or output — put it here; (3) if the criterion is fundamentally about VISUAL fidelity against a specific mockup — not just "add a button" but "match this exact layout/spacing/color" — use "check":"visual" instead (see below); (4) if none of that applies, omit both "command" and "check" entirely and a separate verifier will judge the criterion by reading the repo directly — the weakest rung, only for what genuinely can't be checked mechanically or visually.
-- "check": "visual" (optional, rung 3 above — alternative to "command", never both on the same step): compares the running app against a real mockup file and judges the criterion against it. Only use this when a mockup actually exists in this repo — check first, don't assume. Pair it with "visual": {"mockup": "path/relative/to/repo/root.html", "params": {...}} — "mockup" is the real path to that file (design/<issueId>/index.html is the usual convention, but only if that's genuinely where it lives; point at the actual file otherwise), "params" is whatever this project's capture setup needs to render "ours" (e.g. a Storybook story id) if the project's own capture command requires one.
+- "check": "visual" (optional, rung 3 above — alternative to "command", never both on the same step): compares the running app against a real mockup file and judges the criterion against it. Only use this when a mockup actually exists in this repo — check first, don't assume. Pair it with "visual": {"mockup": "path/relative/to/repo/root.html", "params": {...}} — "mockup" is the real path to that file (design/<issueId>/index.html is the usual convention, but only if that's genuinely where it lives; point at the actual file otherwise), "params" is whatever this project's capture setup needs to render "ours" (e.g. a Storybook story id) if the project's own capture command requires one.${captureRule} If the step is about one part of the screen (a single widget, panel or overlay) rather than the whole screen, also give "visual": {..., "region": [x, y, width, height]} — that element's box in capture pixels, taken from the mockup's own layout (its CSS positions, or /api/extract-elements below) with a few pixels of margin. Both screenshots get cropped to it, so the check isn't failed by other parts of the screen that later steps own.
 
   Before writing a "check":"visual" step, get real geometry instead of eyeballing the mockup yourself: \`curl -X POST http://127.0.0.1:4390/api/extract-elements -H "Content-Type: application/json" -d '{"url":"file:///absolute/path/to/mockup.html","viewport":[W,H]}'\` (viewport should match the size the mockup was designed at). This returns every visually meaningful element with its absolute position, size, and computed style. Review the list and decide which ones are genuine content worth verifying for THIS step versus incidental chrome (a decorative glow, a spacer, anything not part of the actual screen) — the same judgment you'd apply reading it by eye, just against real numbers now. Embed the survivors as "visual": {..., "candidates": [...], "viewport": [W, H]} using the extracted objects as-is (don't hand-edit their box/style fields). A step can have as few as one candidate if that's all this specific criterion is about — don't dump the whole mockup's element list onto every visual step.
 
@@ -864,18 +875,42 @@ const SHARED_SKILL_DIRS = [
   join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'kilo', 'skills'),
 ]
 
-async function buildRunnerConfigContent(projectDir: string): Promise<string> {
+// Read access Claude sessions already have (guard-scope.js only confines
+// writes) but OpenCode/Kilo were denied — ~70 friction rows: the pinned crate
+// sources the bevy-source-lookup skill points at, sibling repos a project
+// depends on by path, and /tmp (where OpenCode itself parks long tool output,
+// then tells the agent to read it). Readable, never editable.
+function readOnlyExternalDirs(): string[] {
+  let root: string | undefined
+  try {
+    root = projectsRoot()
+  } catch {
+    // no project map — nothing to open up beyond the registry
+  }
+  return [join(process.env.CARGO_HOME || join(homedir(), '.cargo'), 'registry'), ...(root ? [root] : [])]
+}
+
+// Rule order matters: the last matching pattern wins, so broad denies come
+// before the narrower allows that carve out of them.
+export async function buildRunnerConfigContent(projectDir: string): Promise<string> {
+  const readOnlyDirs = readOnlyExternalDirs()
   return JSON.stringify({
     permission: {
       external_directory: {
+        '*': 'deny',
+        ...Object.fromEntries([...SHARED_SKILL_DIRS, ...readOnlyDirs, '/tmp'].map((dir) => [`${dir}/*`, 'allow'])),
         [`${projectDir}/*`]: 'allow',
         [projectDir]: 'allow',
-        '*': 'deny',
-        ...Object.fromEntries(SHARED_SKILL_DIRS.map((dir) => [`${dir}/*`, 'allow'])),
       },
       edit: Object.fromEntries([
+        // The edit rule matches the path relative to the project, so a sibling
+        // repo is "../gguy/…" — no absolute pattern below ever matches it
+        // (confirmed live: a sibling edit went through until this was added).
+        ['../*', 'deny'],
+        ...[...SHARED_SKILL_DIRS, ...readOnlyDirs].map((dir) => [`*${dir}/*`, 'deny']),
+        // The project itself sits under PROJECTS_ROOT, so re-allow it after that deny.
+        [`*${projectDir}/*`, 'allow'],
         ...PLAN_FILE_DENY_PATTERNS.map((pattern) => [pattern, 'deny']),
-        ...SHARED_SKILL_DIRS.map((dir) => [`*${dir}/*`, 'deny']),
       ]),
       task: { '*': 'deny' },
     },

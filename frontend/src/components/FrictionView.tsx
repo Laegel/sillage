@@ -21,6 +21,11 @@ const BUCKET_OF: Record<FrictionKind, Bucket> = {
   status_regression: 'orchestration',
   driver_action_failed: 'orchestration',
   ownership_exhausted: 'orchestration',
+  builder_failed: 'backend',
+  check_infra: 'orchestration',
+  step_exhausted: 'orchestration',
+  wrapup_failed: 'orchestration',
+  repeated_failure: 'orchestration',
 }
 
 const BUCKETS: { key: Bucket; label: string; sub: string }[] = [
@@ -28,7 +33,7 @@ const BUCKETS: { key: Bucket; label: string; sub: string }[] = [
   { key: 'harness', label: 'Harness refused', sub: 'guards, read-only, busy' },
   { key: 'tool', label: 'Tool errors', sub: 'a tool genuinely failed' },
   { key: 'backend', label: 'Backend', sub: 'rate limits, stalls, crashes' },
-  { key: 'orchestration', label: 'Orchestration', sub: 'driver, status drift' },
+  { key: 'orchestration', label: 'Orchestration', sub: 'checks, driver, repeats, status drift' },
 ]
 
 // Enough to see patterns without turning the panel back into a transcript.

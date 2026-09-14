@@ -11,3 +11,4 @@ friction-log.jsonl
 plans.json
 synthesis.json
 step-metrics.jsonl
+issue-history-cache.json

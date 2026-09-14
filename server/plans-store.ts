@@ -36,6 +36,9 @@ export interface Step {
     params?: Record<string, string>
     candidates?: ExtractedElement[]
     viewport?: [number, number]
+    // [x, y, width, height] in capture pixels — both screenshots are cropped to
+    // it before the critic compares them (see critic.ts captureRound).
+    region?: [number, number, number, number]
     tolerance?: { position?: number; color?: number; fontSize?: number; borderRadius?: number }
   }
   status: 'pending' | 'done'

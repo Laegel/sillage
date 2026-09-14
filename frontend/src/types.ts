@@ -9,6 +9,7 @@ export interface Issue {
   createdAt?: string
   startedAt?: string | null
   completedAt?: string | null
+  canceledAt?: string | null
   project?: string
   prUrl?: string | null
   priority: number
@@ -37,10 +38,11 @@ export interface Project {
 }
 
 // One column move, from Linear's own Activity/history log for the issue.
+// Mirrors server/types.ts — fromStatus is absent on an issue's first move.
 export interface IssueTransition {
-  fromStatus: string | null
+  fromStatus?: string
   toStatus: string
-  createdAt: string
+  timestamp: string
 }
 
 // Structured events emitted by a running agent, replacing pre-formatted output
@@ -97,6 +99,11 @@ export type FrictionKind =
   | 'ownership_exhausted'
   | 'status_regression'
   | 'run_busy'
+  | 'builder_failed'
+  | 'check_infra'
+  | 'step_exhausted'
+  | 'wrapup_failed'
+  | 'repeated_failure'
 
 export interface FrictionEntry {
   kind: FrictionKind
@@ -132,6 +139,39 @@ export interface StepAttempt {
   outcome: StepOutcome
   builderFailure?: 'rate_limited' | 'no_changes' | 'no_output' | 'stopped' | 'error'
   builderDetail?: string
+}
+
+// Mirrors server/gates-store.ts — gate timings each project writes to its own .gates/.
+export interface GateStep {
+  name: string
+  durationMs: number
+  exitCode: number
+}
+
+export interface GateTest {
+  suite: string
+  name: string
+  durationMs: number
+  status: 'passed' | 'failed' | 'skipped'
+}
+
+export interface GateRun {
+  runId: string
+  gate: string
+  startedAt: string
+  durationMs: number
+  exitCode: number
+  commit: string
+  branch: string
+  trigger: string
+  steps: GateStep[]
+  junit: string[]
+  tests: GateTest[]
+}
+
+export interface GateProject {
+  projectId: string
+  runs: GateRun[]
 }
 
 export interface SynthesisEntry {

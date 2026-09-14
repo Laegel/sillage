@@ -29,7 +29,7 @@ import {
   runMockAgent,
   SILLAGE_ROOT,
 } from './agent.ts'
-import { captureConfigFor, checkRequiredTools, resolveProjectDir, supportsWorktrees } from './project-map.ts'
+import { captureConfigFor, captureParamNames, checkRequiredTools, mappedProjects, resolveProjectDir, supportsWorktrees, validateCaptureParams, validateVisualRegion, type CaptureConfig } from './project-map.ts'
 import {
   captureRound,
   CaptureSideFailure,
@@ -45,11 +45,13 @@ import {
 } from './critic.ts'
 import { deleteChatSession, getChatSession, saveChatSession, type ChatBackend } from './chat-store.ts'
 import { extractElements } from './extract.ts'
+import { getFlowIssues } from './flow-metrics.ts'
+import { loadGateRuns } from './gates-store.ts'
 import { appendStepAttempt, builderFailureReason, loadStepAttempts, modelFromRunLog, type StepAttempt } from './step-metrics-store.ts'
 import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, getActivePlanForIssue, setStep, type Plan, type Step } from './plans-store.ts'
 import { appendUsage, loadUsage } from './usage-store.ts'
 import { getSynthesis, saveSynthesis, type SynthesisEntry } from './synthesis-store.ts'
-import { classifyFriction, appendFriction, loadFriction } from './friction-store.ts'
+import { classifyFriction, appendFriction, loadFriction, repeatTracker, type FrictionEntry } from './friction-store.ts'
 import { loadActiveRuns, saveActiveRun, clearActiveRun, type RunBackend, type RunKind, type ActiveRunRecord } from './run-registry.ts'
 import type { AgentEvent, DriverAction, DriverActionKind, DriverMode, Issue } from './types.ts'
 
@@ -306,6 +308,9 @@ function recordPrCreated(issueId: string, prUrl: string) {
   broadcast({ type: 'issue_updated', issueId })
 }
 
+// Built on first use from the existing log, so a repeat streak survives restarts.
+let trackRepeat: ((entry: FrictionEntry) => FrictionEntry | undefined) | undefined
+
 function broadcast(payload: Record<string, unknown>) {
   const message = JSON.stringify(payload)
   for (const ws of clients) {
@@ -326,7 +331,12 @@ function broadcast(payload: Record<string, unknown>) {
     if (match) recordPrCreated(payload.issueId, match[0])
   }
   const friction = classifyFriction(payload)
-  if (friction) appendFriction(friction)
+  if (friction) {
+    appendFriction(friction)
+    trackRepeat ??= repeatTracker(loadFriction())
+    const repeated = trackRepeat(friction)
+    if (repeated) appendFriction(repeated)
+  }
   routeDriverSignal(payload).catch((err) => console.error('[routeDriverSignal] failed:', err))
   maybeUpdateSynthesis(payload).catch((err) => console.error('[maybeUpdateSynthesis] failed:', err))
   maybeRecordRegression(payload).catch((err) => console.error('[maybeRecordRegression] failed:', err))
@@ -828,7 +838,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
     if (alreadyExhausted) {
       const message = `This card's gauntlet already used all ${MAX_GAUNTLET_ROUNDS} rounds without the implementation beating its design mockup — needs a human look before trying again.`
       await flagIncomplete(issueId, message).catch((err: any) => console.error(`[gauntlet ${issueId}] flag-on-already-exhausted failed:`, err.message))
-      broadcast({ type: 'error', issueId, message })
+      broadcast({ type: 'error', issueId, message, failure: 'step_exhausted' })
       onDone?.({ ok: false, message })
       return
     }
@@ -845,7 +855,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
         // genuinely finished, so there is nothing to capture or judge yet.
         // No round burned, no flag: quota exhaustion isn't an implementation
         // defect, and an external stop means a human already took over.
-        broadcast({ type: 'error', issueId, message: result.message, summary: result.summary })
+        broadcast({ type: 'error', issueId, message: result.message, summary: result.summary, failure: builderFailureTag(result.message) })
         onDone?.(result)
         return
       }
@@ -873,7 +883,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
         if (divergedBranch) {
           const message = `A design mockup exists on branch ${divergedBranch} but not on the branch this run is working from — the design and implementation branches have diverged. Merge or rebase them onto one branch; the gauntlet loop can't judge against a mockup it can't see.`
           await flagIncomplete(issueId, message).catch((err: any) => console.error(`[gauntlet ${issueId}] flag-on-divergence failed:`, err.message))
-          broadcast({ type: 'error', issueId, message })
+          broadcast({ type: 'error', issueId, message, failure: 'check_infra' })
           onDone?.({ ok: false, message })
           return
         }
@@ -906,7 +916,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
         // rather than quietly finishing as if the visual check passed.
         const message = `The visual comparison pipeline failed and could not judge this implementation: ${err.message}`
         await flagIncomplete(issueId, message).catch((e: any) => console.error(`[gauntlet ${issueId}] flag-on-infra-failure failed:`, e.message))
-        broadcast({ type: 'error', issueId, message })
+        broadcast({ type: 'error', issueId, message, failure: 'check_infra' })
         onDone?.({ ok: false, message })
         return
       }
@@ -923,7 +933,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
       } catch (err: any) {
         const message = `The critic run itself failed: ${err.message}`
         await flagIncomplete(issueId, message).catch(() => {})
-        broadcast({ type: 'error', issueId, message })
+        broadcast({ type: 'error', issueId, message, failure: 'check_infra' })
         onDone?.({ ok: false, message })
         return
       }
@@ -935,7 +945,7 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
         // evaporates the one time the critic actually fails to report.
         const message = 'The visual critic produced no usable verdict for this round.'
         await flagIncomplete(issueId, message).catch(() => {})
-        broadcast({ type: 'error', issueId, message })
+        broadcast({ type: 'error', issueId, message, failure: 'check_infra' })
         onDone?.({ ok: false, message })
         return
       }
@@ -983,7 +993,33 @@ function runCardAttempt(issueId: string, task: string, fresh: boolean | undefine
 // resumed session from re-litigating steps already marked done, and the
 // verbatim lastFailure gives a retry the exact reason the previous attempt
 // didn't pass instead of making it re-derive that from scratch.
-function buildStepTask(step: Step, index: number, total: number): string {
+// The capture command for the project an issue belongs to — undefined when the
+// project has none or the issue can't be resolved.
+async function captureConfigForIssue(issueId: string): Promise<CaptureConfig | undefined> {
+  const issue = await linear.getIssue(issueId)
+  return captureConfigFor(basename(resolveProjectDir(issue.project)))
+}
+
+// For the consolidation prompt: the exact param keys, null when the project has
+// no capture command, undefined when the lookup itself failed (prompt stays generic).
+async function captureParamNamesForIssue(issueId: string): Promise<string[] | null | undefined> {
+  try {
+    const cfg = await captureConfigForIssue(issueId)
+    return cfg ? captureParamNames(cfg) : null
+  } catch {
+    return undefined
+  }
+}
+
+// A Builder attempt that never reached a check: a deliberate stop isn't friction.
+function builderFailureTag(message: string): 'builder_failed' | 'stopped' {
+  return builderFailureReason(message) === 'stopped' ? 'stopped' : 'builder_failed'
+}
+
+// `instructions`: the task text whoever started this run gave (a Driver implement
+// action, the Task panel) — it used to reach only cards without a step plan, so a
+// Driver's precise fix for a stepped card (LAE-183) never got to the Builder.
+function buildStepTask(step: Step, index: number, total: number, instructions?: string): string {
   const commandBlock = step.command
     ? `\n\nYou can check your own work with this command — it should exit 0 once this step is genuinely done:\n${step.command}`
     : ''
@@ -994,7 +1030,7 @@ function buildStepTask(step: Step, index: number, total: number): string {
 
 STEP: ${step.title}
 
-This step is DONE when: ${step.criterion}${commandBlock}${failureBlock}`
+This step is DONE when: ${step.criterion}${commandBlock}${failureBlock}${instructions?.trim() ? `\n\nINSTRUCTIONS FOR THIS RUN (from whoever started it — follow them where they apply to this step):\n${instructions.trim()}` : ''}`
 }
 
 const STEPS_BLOCK_START = '<!-- steps:start -->'
@@ -1096,7 +1132,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
         usedFresh = true
 
         const builderStartedAt = Date.now()
-        const result = await runCardAttempt(issueId, buildStepTask(step, steps.indexOf(step) + 1, steps.length), stepFresh, false, true)
+        const result = await runCardAttempt(issueId, buildStepTask(step, steps.indexOf(step) + 1, steps.length, task), stepFresh, false, true)
         const attemptRow = {
           phase: 'step' as const,
           stepId: step.id,
@@ -1111,7 +1147,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
           // Crash, rate limit, or an external stop — same reasoning as
           // runGauntlet's identical branch: nothing to verify yet, no
           // attempt burned.
-          broadcast({ type: 'error', issueId, message: result.message, summary: result.summary })
+          broadcast({ type: 'error', issueId, message: result.message, summary: result.summary, failure: builderFailureTag(result.message) })
           onDone?.(result)
           return
         }
@@ -1134,7 +1170,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
           // actually done, so it must never burn an attempt or read as a fail.
           const message = `Could not verify step "${step.title}": ${verdict.detail}`
           await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-infra failed:`, err.message))
-          broadcast({ type: 'error', issueId, message })
+          broadcast({ type: 'error', issueId, message, failure: 'check_infra' })
           onDone?.({ ok: false, message })
           return
         }
@@ -1158,7 +1194,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
           const doneCount = steps.filter((s) => s.status === 'done').length
           const message = `Step "${step.title}" failed verification after ${MAX_STEP_ATTEMPTS} attempts and needs a human look. Criterion: ${step.criterion}\nLast failure: ${step.lastFailure}`
           await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-exhaustion failed:`, err.message))
-          broadcast({ type: 'error', issueId, message, steps: { done: doneCount, total: steps.length, failedStep: step.title, lastFailure: step.lastFailure } })
+          broadcast({ type: 'error', issueId, message, failure: 'step_exhausted', steps: { done: doneCount, total: steps.length, failedStep: step.title, lastFailure: step.lastFailure } })
           onDone?.({ ok: false, message })
           return
         }
@@ -1188,7 +1224,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
     if (!wrapUp.ok) {
       const message = `All steps passed verification, but opening the PR failed: ${wrapUp.message}`
       await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-wrapup failed:`, err.message))
-      broadcast({ type: 'error', issueId, message })
+      broadcast({ type: 'error', issueId, message, failure: 'wrapup_failed' })
       onDone?.({ ok: false, message })
       return
     }
@@ -1442,7 +1478,7 @@ function runRefine(
         // Deferred past this run's own `finally` (which hasn't executed yet —
         // we're still inside its `try` block) so the busy-check in runRefine
         // doesn't reject it as already-active.
-        queueMicrotask(() => runRefine(issueId, () => buildConsolidatePrompt(issueId), undefined, true, true))
+        queueMicrotask(() => runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId)), undefined, true, true))
       }
       onDone?.({ ok: true, message: trimmedSummary || 'refine turn complete (no text output)' })
     } catch (err: any) {
@@ -1483,7 +1519,7 @@ function handleRefineMessage(ws: WebSocket, payload: any) {
 function handleRefineConsolidate(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   if (!issueId) return send(ws, { type: 'error', message: 'issueId is required' })
-  const started = runRefine(issueId, () => buildConsolidatePrompt(issueId), undefined, true)
+  const started = runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId)), undefined, true)
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
 
@@ -2136,6 +2172,7 @@ async function runOwnershipUpdateTurn(
         action: 'flag',
         issueId: u.issueId,
         status: 'done',
+        escalated: true,
         message: `escalated for human review — exceeded ${MAX_OWNERSHIP_REPROMPTS_PER_CARD} status-update turns without reaching Done`,
       })
       continue
@@ -2512,8 +2549,17 @@ const server = http.createServer(async (req, res) => {
     if (path === '/hook-event' && req.method === 'POST') return handleHookEvent(req, res)
     if (path.startsWith('/api/linear')) return handleLinearApi(req, res, path)
     if (path === '/api/usage' && req.method === 'GET') return json(res, 200, { entries: loadUsage() })
+    if (path === '/api/metrics/flow' && req.method === 'GET') {
+      const since = new Date(url.searchParams.get('since') || '')
+      if (Number.isNaN(since.getTime())) return json(res, 400, { error: 'since must be an ISO date' })
+      return json(res, 200, { issues: await getFlowIssues(linear, since) })
+    }
     if (path === '/api/friction' && req.method === 'GET') return json(res, 200, { entries: loadFriction() })
     if (path === '/api/step-metrics' && req.method === 'GET') return json(res, 200, { entries: loadStepAttempts() })
+    if (path === '/api/gates' && req.method === 'GET') {
+      const projects = mappedProjects().map(({ projectId, dir }) => ({ projectId, runs: loadGateRuns(dir) }))
+      return json(res, 200, { projects })
+    }
     const synthesisMatch = path.match(/^\/api\/synthesis\/([^/]+)(\/generate)?$/)
     if (synthesisMatch) {
       const [, projectId, generate] = synthesisMatch
@@ -2681,6 +2727,7 @@ const server = http.createServer(async (req, res) => {
                     candidates: Array.isArray(s.visual.candidates) ? s.visual.candidates : undefined,
                     viewport: Array.isArray(s.visual.viewport) ? (s.visual.viewport as [number, number]) : undefined,
                     tolerance: s.visual.tolerance && typeof s.visual.tolerance === 'object' ? s.visual.tolerance : undefined,
+                    region: Array.isArray(s.visual.region) ? (s.visual.region as [number, number, number, number]) : undefined,
                   }
                 : undefined,
               status: 'pending',
@@ -2688,6 +2735,30 @@ const server = http.createServer(async (req, res) => {
             }))
           }
           const issueId = typeof body.issueId === 'string' ? body.issueId : undefined
+          // A visual step's params must be exactly what this project's capture
+          // command substitutes — caught here instead of as a "check could not
+          // run" flag on every attempt (LAE-183: {"run": ...} where only {scene} works).
+          if (steps?.some((step) => step.check === 'visual')) {
+            if (!issueId) return json(res, 400, { error: 'plans with "check":"visual" steps need an issueId, to know which project\'s capture command applies' })
+            const capture = await captureConfigForIssue(issueId)
+            if (!capture) {
+              return json(res, 400, { error: 'this project has no capture command configured, so "check":"visual" steps cannot run — use a "command" instead' })
+            }
+            for (const step of steps) {
+              if (step.check !== 'visual') continue
+              if (step.visual?.region) {
+                const why = validateVisualRegion(step.visual.region, capture.viewport)
+                if (why) return json(res, 400, { error: `step "${step.title}" visual.region: ${why}` })
+              }
+              if (!step.visual?.params) continue
+              const { missing, unknown } = validateCaptureParams(capture, step.visual.params)
+              if (missing.length || unknown.length) {
+                const expected = captureParamNames(capture).map((name) => `"${name}"`).join(', ') || '(none)'
+                const problems = [missing.length && `missing ${missing.join(', ')}`, unknown.length && `unknown ${unknown.join(', ')}`].filter(Boolean).join('; ')
+                return json(res, 400, { error: `step "${step.title}" visual.params: ${problems}. This project's capture command takes exactly: ${expected} (plain string values, e.g. a scene name — not a shell command).` })
+              }
+            }
+          }
           const plan = savePlan({
             title,
             content,

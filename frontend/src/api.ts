@@ -1,4 +1,5 @@
-import type { Comment, FrictionEntry, Issue, IssueTransition, Plan, Project, StepAttempt, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
+import type { FlowIssue } from './lib/metrics.ts'
+import type { Comment, FrictionEntry, GateProject, Issue, IssueTransition, Plan, Project, StepAttempt, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -69,6 +70,14 @@ export function fetchUsage(): Promise<{ entries: UsageEntry[] }> {
 
 export function fetchFriction(): Promise<{ entries: FrictionEntry[] }> {
   return request('/api/friction')
+}
+
+export function fetchFlowIssues(since: Date): Promise<{ issues: FlowIssue[] }> {
+  return request(`/api/metrics/flow?since=${encodeURIComponent(since.toISOString())}`)
+}
+
+export function fetchGates(): Promise<{ projects: GateProject[] }> {
+  return request('/api/gates')
 }
 
 export function fetchStepMetrics(): Promise<{ entries: StepAttempt[] }> {

@@ -5,7 +5,7 @@ import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { buildCritiquePrompt, buildVerifyPrompt, runClaude, SILLAGE_ROOT } from './agent.ts'
 import { extractElementsAndScreenshot, type ExtractedElement } from './extract.ts'
-import { captureConfigFor, captureParamNames, isDomInspectable, type CaptureConfig } from './project-map.ts'
+import { captureConfigFor, captureParamNames, isDomInspectable, validateCaptureParams, type CaptureConfig } from './project-map.ts'
 import type { AgentEvent } from './types.ts'
 
 const execFileAsync = promisify(execFile)
@@ -74,26 +74,33 @@ export function resolveBar(
   const cfg = captureConfigFor(basename(projectDir))
   if (!cfg) return { ok: false, why: `no capture command configured for project "${basename(projectDir)}"` }
 
+  // Step params replace capture.json entirely — so every message names which
+  // one was read. Blaming capture.json for a step's bad params (LAE-183) sent
+  // the Driver and Builder to fix a file that was never consulted.
   let params: Record<string, unknown>
+  let source: string
   if (step?.visual?.params) {
     params = step.visual.params
+    source = 'the plan step\'s visual.params'
   } else {
     const captureJsonPath = join(designDir, 'capture.json')
+    source = `design/${issueId}/capture.json`
     if (!existsSync(captureJsonPath)) {
-      return { ok: false, why: 'mockup exists but has no capture.json alongside it (and the step supplied no visual.params)' }
+      return { ok: false, why: `mockup exists but has no ${source} alongside it (and the step supplied no visual.params)` }
     }
     try {
       const parsed = JSON.parse(readFileSync(captureJsonPath, 'utf8'))
       params = (parsed && typeof parsed === 'object' && parsed.params) || {}
     } catch {
-      return { ok: false, why: 'capture.json exists but is not valid JSON' }
+      return { ok: false, why: `${source} exists but is not valid JSON` }
     }
   }
 
-  const required = captureParamNames(cfg)
-  const missing = required.filter((name) => typeof params[name] !== 'string' || !params[name])
+  const { missing, unknown } = validateCaptureParams(cfg, params)
   if (missing.length > 0) {
-    return { ok: false, why: `capture.json is missing required param(s): ${missing.join(', ')}` }
+    const expected = captureParamNames(cfg).map((name) => `"${name}"`).join(', ')
+    const extra = unknown.length ? ` (it has unknown key(s) ${unknown.join(', ')} instead)` : ''
+    return { ok: false, why: `${source} is missing required capture param(s): ${missing.join(', ')}${extra} — this project's capture command takes exactly ${expected}` }
   }
 
   return { ok: true, mockup, cfg, params: params as Record<string, string> }
@@ -230,6 +237,10 @@ async function assertRealScreenshot(png: string): Promise<void> {
   if (!(sd >= 0.01)) throw new Error(`capture produced a blank/uniform image (${png}) — the app or the renderer never drew anything`)
 }
 
+export async function cropTo(png: string, [x, y, w, h]: [number, number, number, number]): Promise<void> {
+  await execFileAsync('convert', [png, '-crop', `${w}x${h}+${x}+${y}`, '+repage', png])
+}
+
 async function normalizeTo(png: string, [w, h]: [number, number]): Promise<void> {
   await execFileAsync('convert', [png, '-strip', '-resize', `${w}x${h}!`, png])
 }
@@ -275,7 +286,13 @@ export class CaptureSideFailure extends Error {
   }
 }
 
-export async function captureRound(bar: Extract<BarResolution, { ok: true }>, projectDir: string, issueId: string, round: number): Promise<CaptureRoundResult> {
+export async function captureRound(
+  bar: Extract<BarResolution, { ok: true }>,
+  projectDir: string,
+  issueId: string,
+  round: number | string,
+  region?: [number, number, number, number],
+): Promise<CaptureRoundResult> {
   const roundDir = join(CRITIC_DIR, sanitizeForPath(issueId), String(round))
   mkdirSync(roundDir, { recursive: true })
 
@@ -301,6 +318,11 @@ export async function captureRound(bar: Extract<BarResolution, { ok: true }>, pr
   }
   await normalizeTo(mockupPng, bar.cfg.viewport)
   await normalizeTo(oursPng, bar.cfg.viewport)
+  // Same crop on both sides, after normalizing, so the coordinates mean the same pixels.
+  if (region) {
+    await cropTo(mockupPng, region)
+    await cropTo(oursPng, region)
+  }
 
   if (await imagesAreIdentical(mockupPng, oursPng)) {
     throw new Error('mockup and app screenshots are pixel-identical — refusing to ask a critic to compare an image with itself')
@@ -501,7 +523,7 @@ async function verifyStepGeometry(
   params: Record<string, string>,
   projectDir: string,
   issueId: string,
-  round: number,
+  round: number | string,
 ): Promise<StepVerdict> {
   const tolerance = { ...DEFAULT_TOLERANCE, ...toleranceOverride }
   const roundDir = join(CRITIC_DIR, sanitizeForPath(issueId), String(round))
@@ -601,8 +623,10 @@ export async function verifyStep(
       candidates?: ExtractedElement[]
       viewport?: [number, number]
       tolerance?: { position?: number; color?: number; fontSize?: number; borderRadius?: number }
+      region?: [number, number, number, number]
     }
     attempts: number
+    id?: string
   },
   projectDir: string,
   issueId: string,
@@ -611,6 +635,10 @@ export async function verifyStep(
   if (step.check === 'visual') {
     const bar = resolveBar(issueId, projectDir, step)
     if (!bar.ok) return { kind: 'infra', detail: bar.why }
+    // uploads/critic/<issue>/<step>/<attempt>: numbering by attempt alone let one
+    // step's captures overwrite another's (LAE-183's prep step replaced the
+    // compass step's attempt-5 evidence).
+    const captureFolder = step.id ? `${sanitizeForPath(step.id)}/${step.attempts + 1}` : step.attempts + 1
 
     if (step.visual?.candidates?.length && isDomInspectable(basename(projectDir))) {
       return verifyStepGeometry(
@@ -621,13 +649,13 @@ export async function verifyStep(
         bar.params,
         projectDir,
         issueId,
-        step.attempts + 1,
+        captureFolder,
       )
     }
 
     let capture: CaptureRoundResult
     try {
-      capture = await captureRound(bar, projectDir, issueId, step.attempts + 1)
+      capture = await captureRound(bar, projectDir, issueId, captureFolder, step.visual?.region)
     } catch (err: any) {
       if (err instanceof CaptureSideFailure) return { kind: 'checked', pass: false, detail: err.message }
       return { kind: 'infra', detail: err.message }

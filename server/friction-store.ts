@@ -18,6 +18,13 @@ export type FrictionKind =
   | 'ownership_exhausted'
   | 'status_regression'
   | 'run_busy'
+  // Pilot's own step-loop failures, tagged by the broadcast's `failure` field.
+  | 'builder_failed'
+  | 'check_infra'
+  | 'step_exhausted'
+  | 'wrapup_failed'
+  // The same failure (kind + detail) hitting one issue again in a row.
+  | 'repeated_failure'
 
 export interface FrictionEntry {
   kind: FrictionKind
@@ -65,20 +72,41 @@ export function toolFailureKind(errorText: string): 'tool_denied' | 'tool_error'
 
 export const MAX_DETAIL = 300
 
-// Runs on every broadcast (see index.ts broadcast()), so it sees every agent
-// event from every backend. Structured signals only: a status the agent itself
-// reported as blocked/needing action, and tool calls that ended in error. Both
-// are already parsed into AgentEvents by agent.ts — this just stops dropping
-// them. `completed` and `review_ready` are healthy terminal states, not friction.
-export function classifyFriction(payload: Record<string, unknown>): FrictionEntry | undefined {
-  const event = payload.event as AgentEvent | undefined
-  if (!event) return undefined
+const FAILURE_TAGS = new Set<FrictionKind>(['builder_failed', 'check_infra', 'step_exhausted', 'wrapup_failed'])
 
+// Runs on every broadcast (see index.ts broadcast()). Two sources, both
+// structured: pilot's own orchestration signals (a failed run or step check,
+// a stall, a failed Driver action, an ownership escalation) — which carry no
+// agent `event` and were once silently dropped here — and the agent events
+// agent.ts already parses (a status the agent reported as blocked, tool calls
+// that ended in error). `completed` and `review_ready` are healthy terminal
+// states, not friction.
+export function classifyFriction(payload: Record<string, unknown>): FrictionEntry | undefined {
   const base = {
     timestamp: new Date().toISOString(),
     issueId: typeof payload.issueId === 'string' ? payload.issueId : undefined,
     sessionId: typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
   }
+  const message = typeof payload.message === 'string' ? payload.message.slice(0, MAX_DETAIL) : ''
+
+  if (payload.type === 'error') {
+    // A run someone deliberately stopped isn't an agent or pilot getting stuck.
+    if (payload.failure === 'stopped') return undefined
+    const tag = payload.failure as FrictionKind
+    return { ...base, kind: FAILURE_TAGS.has(tag) ? tag : 'run_failed', detail: message }
+  }
+  if (payload.type === 'stall_detected') {
+    const seconds = Math.round(Number(payload.thresholdMs) / 1000)
+    return { ...base, kind: 'stalled', detail: `no activity for ${seconds}s` }
+  }
+  if (payload.type === 'driver_action') {
+    if (payload.escalated) return { ...base, kind: 'ownership_exhausted', detail: message }
+    if (payload.status === 'failed') return { ...base, kind: 'driver_action_failed', detail: `${payload.action}: ${message}` }
+    return undefined
+  }
+
+  const event = payload.event as AgentEvent | undefined
+  if (!event) return undefined
 
   if (event.kind === 'status') {
     if (event.category === 'rate_limited' || event.category === 'backend_fallback') {
@@ -102,4 +130,38 @@ export function classifyFriction(payload: Record<string, unknown>): FrictionEntr
   }
 
   return undefined
+}
+
+// Same issue, same failure kind and detail as its previous failure → a
+// repeated_failure row with the running count: a loop retrying something that
+// can't succeed (e.g. the Driver re-sending one fix three times) is invisible
+// as three unrelated rows. Seeded from the existing log so a restart doesn't
+// forget the streak.
+const REPEATABLE = new Set<FrictionKind>([...FAILURE_TAGS, 'run_failed', 'stalled', 'driver_action_failed'])
+
+export function repeatTracker(history: FrictionEntry[]): (entry: FrictionEntry) => FrictionEntry | undefined {
+  const last = new Map<string, { signature: string; count: number }>()
+  const track = (entry: FrictionEntry): FrictionEntry | undefined => {
+    if (!entry.issueId || !REPEATABLE.has(entry.kind)) return undefined
+    const signature = `${entry.kind}\n${entry.detail}`
+    const previous = last.get(entry.issueId)
+    const count = previous?.signature === signature ? previous.count + 1 : 1
+    last.set(entry.issueId, { signature, count })
+    if (count < 2) return undefined
+    return { kind: 'repeated_failure', timestamp: entry.timestamp, issueId: entry.issueId, detail: `${entry.kind} ×${count}: ${entry.detail}`.slice(0, MAX_DETAIL) }
+  }
+  for (const entry of history) track(entry)
+  return track
+}
+
+// Run-log mining re-finds tool events that live capture already recorded once it
+// started (2026-09-13) — 25 events were in the log twice. Keep backfilled tool
+// events only from before the first live one; other kinds come from sources
+// live capture never saw.
+const TOOL_KINDS = new Set<FrictionKind>(['tool_denied', 'tool_error', 'agent_blocked'])
+
+export function dropLiveOverlap(mined: FrictionEntry[], live: FrictionEntry[]): FrictionEntry[] {
+  const liveSince = live.filter((e) => TOOL_KINDS.has(e.kind)).map((e) => e.timestamp).sort()[0]
+  if (!liveSince) return mined
+  return mined.filter((e) => !TOOL_KINDS.has(e.kind) || e.timestamp < liveSince)
 }

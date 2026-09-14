@@ -6,6 +6,10 @@ export interface Issue {
   url: string
   branchName: string
   updatedAt?: Date
+  createdAt?: string
+  startedAt?: string
+  completedAt?: string
+  canceledAt?: string
   project?: string
   priority: number
   priorityLabel: string
@@ -32,6 +36,19 @@ export interface IssueTransition {
   fromStatus?: string
   toStatus: string
   timestamp: string
+}
+
+// An issue as the Metrics flow charts need it (see LinearStore.listFlowIssues);
+// server/flow-metrics.ts adds its transitions.
+export interface FlowIssueBase {
+  id: string
+  project?: string
+  status: string
+  createdAt: string
+  startedAt?: string
+  completedAt?: string
+  canceledAt?: string
+  updatedAt: string
 }
 
 export interface Comment {
@@ -112,5 +129,6 @@ export interface LinearStoreLike {
   listComments(identifier: string): Promise<Comment[]>
   listSubIssues(identifier: string): Promise<SubIssue[]>
   listIssueHistory(identifier: string): Promise<IssueTransition[]>
+  listFlowIssues(since: Date): Promise<FlowIssueBase[]>
   invalidateIssue(identifier: string): void
 }

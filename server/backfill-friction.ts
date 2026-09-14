@@ -9,7 +9,8 @@
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { FRICTION_FILE, MAX_DETAIL, loadFriction, toolFailureKind, type FrictionEntry } from './friction-store.ts'
+import { FRICTION_FILE, MAX_DETAIL, dropLiveOverlap, loadFriction, repeatTracker, toolFailureKind, type FrictionEntry, type FrictionKind } from './friction-store.ts'
+import { loadStepAttempts } from './step-metrics-store.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const RUN_LOGS = join(ROOT, 'run-logs')
@@ -124,9 +125,31 @@ function mineFile(file: string, bySession: Map<string, string>): FrictionEntry[]
   return [...found, ...byToolUse.values()]
 }
 
+// Step-loop failures only ever existed as step-metrics rows until the live
+// classifier learned pilot's own error broadcasts. Only rows older than the
+// first live row of these kinds, so the two sources never double-count.
+const STEP_FAILURE_KIND: Partial<Record<string, FrictionKind>> = { check_infra: 'check_infra', exhausted: 'step_exhausted', builder_failed: 'builder_failed' }
+
+function mineStepMetrics(live: FrictionEntry[]): FrictionEntry[] {
+  const liveSince = live.filter((e) => ['check_infra', 'step_exhausted', 'builder_failed', 'wrapup_failed'].includes(e.kind)).map((e) => e.timestamp).sort()[0]
+  const rows = loadStepAttempts().filter((r) => (!liveSince || r.timestamp < liveSince) && r.builderFailure !== 'stopped')
+  const entries = rows.flatMap((r): FrictionEntry[] => {
+    const kind = r.phase === 'wrap_up' && r.outcome === 'builder_failed' ? 'wrapup_failed' : STEP_FAILURE_KIND[r.outcome]
+    if (!kind) return []
+    const detail = kind === 'check_infra' ? `Could not verify step "${r.stepTitle}": ${r.verdictDetail}` : r.builderDetail ?? r.verdictDetail ?? r.outcome
+    return [{ kind, timestamp: r.timestamp, issueId: r.issueId, backend: r.backend, source: 'backfill', detail: detail.slice(0, MAX_DETAIL) }]
+  })
+  const track = repeatTracker([])
+  return entries.flatMap((e) => {
+    const repeated = track(e)
+    return repeated ? [e, { ...repeated, source: 'backfill' as const }] : [e]
+  })
+}
+
 const bySession = sessionToIssue()
 const files = readdirSync(RUN_LOGS).filter((f) => f.endsWith('.ndjson'))
-const mined = files.flatMap((f) => mineFile(f, bySession))
+const liveRows = loadFriction().filter((e) => e.source !== 'backfill')
+const mined = dropLiveOverlap([...files.flatMap((f) => mineFile(f, bySession)), ...mineStepMetrics(liveRows)], liveRows)
 
 // Parse everything first, then read-and-rewrite back to back: the live server
 // appends to this same file, so keep the window between the two tiny.

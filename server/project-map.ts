@@ -65,6 +65,24 @@ function loadMap(): ProjectMapFile {
   return JSON.parse(readFileSync(MAP_FILE, 'utf8'))
 }
 
+// Where every mapped project lives — sibling repos (e.g. a path dependency like
+// ldaahbevy's ../gguy/gguy-core) are under it.
+export function projectsRoot(): string {
+  return resolve(loadMap().PROJECTS_ROOT)
+}
+
+// Every Linear project with a local folder that exists, e.g. for reading
+// per-project files (gate timings) across all of them.
+export function mappedProjects(): { projectId: string; dir: string }[] {
+  return Object.keys(loadMap().projects).flatMap((projectId) => {
+    try {
+      return [{ projectId, dir: resolveProjectDir(projectId) }]
+    } catch {
+      return []
+    }
+  })
+}
+
 export function resolveProjectDir(linearProjectId: string | undefined): string {
   if (!linearProjectId) {
     throw new Error('This issue has no Linear project set — cannot determine which local folder to run in.')
@@ -134,6 +152,31 @@ const CAPTURE_PLACEHOLDER = /\{(\w+)\}/g
 
 // Derived from the command template rather than declared separately in
 // project-map.json, so the two can never drift out of sync with each other.
+// A step's (or capture.json's) params against what the capture command
+// actually substitutes — a key it doesn't use is as wrong as a missing one:
+// LAE-183's plan passed {"run": "<shell command>"} where only {scene} works.
+export function validateCaptureParams(cfg: CaptureConfig, params: Record<string, unknown>): { missing: string[]; unknown: string[] } {
+  const required = captureParamNames(cfg)
+  return {
+    missing: required.filter((name) => typeof params[name] !== 'string' || !params[name]),
+    unknown: Object.keys(params).filter((key) => !required.includes(key)),
+  }
+}
+
+// A visual step's `region`: [x, y, width, height] in viewport pixels. Returns
+// why it's invalid, or undefined. A step about one element (a compass) gets
+// judged on that crop only — comparing the whole frame failed LAE-183's compass
+// step on a minimap and hotbar that other steps own.
+export function validateVisualRegion(region: unknown, [vw, vh]: [number, number]): string | undefined {
+  if (!Array.isArray(region) || region.length !== 4 || region.some((n) => typeof n !== 'number' || !Number.isFinite(n))) {
+    return 'region must be [x, y, width, height] numbers'
+  }
+  const [x, y, w, h] = region as number[]
+  if (x < 0 || y < 0 || w <= 0 || h <= 0) return 'region needs a non-negative origin and a positive size'
+  if (x + w > vw || y + h > vh) return `region [${region.join(', ')}] extends past the ${vw}x${vh} capture`
+  return undefined
+}
+
 export function captureParamNames(cfg: CaptureConfig): string[] {
   const names = new Set<string>()
   for (const arg of cfg.command) {
