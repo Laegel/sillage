@@ -66,12 +66,27 @@ if (tool_name === "Edit" || tool_name === "Write") {
   }
 }
 
+// A heredoc body is data fed to a command, not shell — LAE-185's refine turn
+// was blocked building an issue description whose JS snippet contained `=>`.
+// The opening line (with any `> file` after it) is kept, so a heredoc written
+// to a file is still caught.
+function withoutHeredocBodies(cmd) {
+  return cmd.replace(/(<<-?\s*(['"]?)(\w+)\2[^\n]*)\n[\s\S]*?\n\s*\3(?=\n|$)/g, "$1");
+}
+
+// Absolute paths count as "outside" only when they actually are — a design
+// session was blocked removing its own draft file by absolute path.
+function hasAbsolutePathOutsideProject(cmd) {
+  const paths = cmd.match(/(?:^|\s)(\/[^\s;&|'"()]*)/g) || [];
+  return paths.map((p) => p.trim()).some((p) => !/^\/dev\/null\b/.test(p) && isOutsideProject(p));
+}
+
 // ponytail: regex heuristics, not a real shell parser — a determined bypass via
 // quoting is possible; upgrade path is containerized execution scoped to the
 // project directory if stronger isolation is ever needed.
 if (tool_name === "Bash") {
   const cmd = tool_input.command || "";
-  const rest = withoutTmpWrites(cmd);
+  const rest = withoutTmpWrites(withoutHeredocBodies(cmd));
 
   if (readOnly) {
     const mutates = /\b(git\s+(commit|push|checkout|reset|add)|gh\s+pr\s+(create|merge)|rm|mv|cp|tee|sudo|sed\s+-i|(npm|cargo)\s+publish)\b/.test(rest);
@@ -81,7 +96,7 @@ if (tool_name === "Bash") {
   }
 
   const writeIntent = /\b(mv|rm|cp|sed -i|tee)\b/.test(rest) || hasFileRedirect(rest);
-  const escapesProject = /(^|\s)\.\.\//.test(cmd) || /(^|\s)~\//.test(cmd) || /(^|\s)\/(?!dev\/null\b)\S/.test(cmd);
+  const escapesProject = /(^|\s)\.\.\//.test(rest) || /(^|\s)~\//.test(rest) || hasAbsolutePathOutsideProject(rest);
   if (writeIntent && escapesProject) {
     deny(`Blocked: command appears to write outside the project directory ("${cmd}").`);
   }
