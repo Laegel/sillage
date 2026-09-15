@@ -705,6 +705,11 @@ export default function App() {
             return { ...prev, [msg.sessionId]: { ...session, issueId: msg.issueId } }
           })
           break
+        case 'design_link_conflict':
+          if (window.confirm(`${msg.issueId} already has a mockup. Replace it with this draft? The current one is deleted.`)) {
+            send({ type: 'design_link_issue', sessionId: msg.sessionId, projectId: designSessionsRef.current[msg.sessionId]?.projectId, issueId: msg.issueId, replace: true })
+          }
+          break
         case 'design_committed':
           setDesignCommitting((prev) => {
             const next = new Set(prev)
@@ -955,7 +960,7 @@ export default function App() {
   }
 
   const handleDesignMessage = (sessionId: string, message: string, images?: string[]) => {
-    const { projectId, model, effort } = designSessionsRef.current[sessionId] ?? {}
+    const { projectId, issueId, model, effort } = designSessionsRef.current[sessionId] ?? {}
     setDesignSessions((prev) => {
       const session = prev[sessionId]
       if (!session) return prev
@@ -977,7 +982,7 @@ export default function App() {
         },
       }
     })
-    send({ type: 'design_message', sessionId, projectId, message, images, model, effort })
+    send({ type: 'design_message', sessionId, projectId, issueId, message, images, model, effort })
   }
 
   const handleLinkDesignIssue = (sessionId: string, issueId: string) => {

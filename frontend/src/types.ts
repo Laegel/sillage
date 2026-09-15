@@ -340,4 +340,5 @@ export type WsMessage =
   | { type: 'design_output'; sessionId: string; event: AgentEvent }
   | { type: 'design_turn_done'; sessionId: string }
   | { type: 'design_issue_linked'; sessionId: string; issueId: string }
+  | { type: 'design_link_conflict'; sessionId: string; issueId: string }
   | { type: 'design_committed'; sessionId: string; ok: boolean; message: string }

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { designIssueFor, designTurnMessage, planDesignLink } from './design-link.ts'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -2448,13 +2449,14 @@ function handleDesignMessage(ws: WebSocket, payload: any) {
   if (!sessionId || !projectId || (!message.trim() && images.length === 0)) {
     return send(ws, { type: 'error', message: 'sessionId, projectId, and a message or image are required' })
   }
-  const issueId = designSessionIssue.get(sessionId)
+  const issueId = designIssueFor(payload.issueId, designSessionIssue.get(sessionId))
+  if (issueId) designSessionIssue.set(sessionId, issueId)
   const designDir = resolveDesignDir(projectId, sessionId, issueId)
   const started = runDesign(sessionId, projectId, designDir, parseClaudeChoice(payload), async () => {
     const paths = saveIdeationImages(sessionId, images)
     const imageNote = paths.length > 0 ? `\n\n[Attached image(s) — use the Read tool to view them before responding]\n${paths.map((p) => `- ${p}`).join('\n')}` : ''
     const existing = getChatSession(sessionId)
-    if (existing) return `${message}${imageNote}`
+    if (existing) return designTurnMessage(`${message}${imageNote}`, designDir)
     const issue = issueId ? await linear.getIssue(issueId) : undefined
     const projectDir = resolveProjectDir(projectId)
     const viewport = captureConfigFor(basename(projectDir))?.viewport
@@ -2477,7 +2479,11 @@ function handleDesignLinkIssue(ws: WebSocket, payload: any) {
   }
   const previousDir = resolveDesignDir(projectId, sessionId, designSessionIssue.get(sessionId))
   const newDir = resolveDesignDir(projectId, sessionId, issueId)
-  if (previousDir !== newDir && existsSync(previousDir) && !existsSync(newDir)) {
+  const plan = planDesignLink(previousDir, newDir, existsSync, payload.replace === true)
+  // The issue already has a mockup: ask before overwriting it (the frontend confirms, then resends with replace).
+  if (plan === 'conflict') return send(ws, { type: 'design_link_conflict', sessionId, issueId })
+  if (plan === 'replace') rmSync(newDir, { recursive: true, force: true })
+  if (plan === 'move' || plan === 'replace') {
     mkdirSync(dirname(newDir), { recursive: true })
     renameSync(previousDir, newDir)
   }
