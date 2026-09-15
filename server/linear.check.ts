@@ -58,16 +58,16 @@ expect('drops tool events after live capture began', kept.map((e) => `${e.kind}@
 const raw = {
   identifier: 'LAE-7', title: 'T', description: null, url: 'u', branchName: 'b', priority: 2, priorityLabel: 'High',
   createdAt: '2026-09-01T10:00:00.000Z', startedAt: '2026-09-02T10:00:00.000Z', completedAt: null, canceledAt: null, updatedAt: '2026-09-03T10:00:00.000Z',
-  state: { name: 'In Progress' }, project: { id: 'p1' }, projectMilestone: { name: 'v1' }, parent: { id: 'x' },
+  state: { name: 'In Progress' }, project: { id: 'p1' }, projectMilestone: { name: 'v1' }, parent: { identifier: 'LAE-1' },
   labels: { nodes: [{ name: 'ui', color: '#fff' }, { name: 'Claude', color: '#000' }] }, children: { nodes: [] },
 }
 expect('raw issue mapping', mapRawIssue(raw), {
   id: 'LAE-7', title: 'T', description: '', status: 'In Progress', url: 'u', branchName: 'b', updatedAt: new Date('2026-09-03T10:00:00.000Z'),
   createdAt: '2026-09-01T10:00:00.000Z', startedAt: '2026-09-02T10:00:00.000Z', project: 'p1', priority: 2, priorityLabel: 'High',
-  milestone: 'v1', labels: [{ name: 'ui', color: '#fff' }], isSubIssue: true, hasSubIssues: false,
+  milestone: 'v1', labels: [{ name: 'ui', color: '#fff' }], isSubIssue: true, parentId: 'LAE-1', hasSubIssues: false,
 })
 const bare = mapRawIssue({ ...raw, state: null, project: null, projectMilestone: null, parent: null, children: { nodes: [{ id: 'c' }] } })
-expect('raw issue defaults', [bare.status, bare.project, bare.milestone, bare.isSubIssue, bare.hasSubIssues], ['Backlog', undefined, undefined, false, true])
+expect('raw issue defaults', [bare.status, bare.project, bare.milestone, bare.isSubIssue, bare.parentId, bare.hasSubIssues], ['Backlog', undefined, undefined, false, undefined, true])
 
 console.log(failed ? `${failed} failing` : 'all passing')
 process.exit(failed ? 1 : 0)

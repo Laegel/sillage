@@ -17,6 +17,7 @@ export interface Issue {
   milestone?: string
   labels: IssueLabel[]
   isSubIssue: boolean
+  parentId?: string
   hasSubIssues: boolean
   parent?: SubIssue
 }

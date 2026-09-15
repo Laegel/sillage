@@ -1,5 +1,6 @@
 import React from 'react'
 import type { Issue, Project } from '../types.ts'
+import { childCounts, groupByParent } from '../lib/board.ts'
 
 export default function IssueTracker({
   issues,
@@ -56,6 +57,9 @@ export default function IssueTracker({
   const visibleIssues = issues.filter(
     (issue) => selectedProjectId === 'all' || issue.project === selectedProjectId,
   )
+
+  // Counted over every issue, so a parent in another column or project still shows its sub-issues.
+  const subIssueCounts = childCounts(issues)
 
   const projectName = (id: string) => projects.find((p) => p.id === id)?.name || id
 
@@ -125,7 +129,7 @@ export default function IssueTracker({
 
       <div className="columns">
         {columns.map((column) => {
-          const columnIssues = visibleIssues.filter((issue) => issue.status === column)
+          const columnIssues = groupByParent(visibleIssues.filter((issue) => issue.status === column))
           return (
             <div
               key={column}
@@ -152,7 +156,7 @@ export default function IssueTracker({
                   <div className="issue-id">{issue.id}</div>
                   <div className="issue-title">{issue.title}</div>
                   {issue.description && <div className="issue-description">{issue.description}</div>}
-                  {(issue.project || issue.milestone || issue.priority > 0 || issue.hasSubIssues) && (
+                  {(issue.project || issue.milestone || issue.priority > 0 || issue.hasSubIssues || issue.parentId || subIssueCounts[issue.id]) && (
                     <div className="issue-meta">
                       {issue.project && (
                         <span className="issue-meta-badge project">▤ {projectName(issue.project)}</span>
@@ -163,7 +167,12 @@ export default function IssueTracker({
                           ● {issue.priorityLabel}
                         </span>
                       )}
-                      {issue.hasSubIssues && <span className="issue-meta-badge subissues">⊟ Sub-issues</span>}
+                      {(issue.hasSubIssues || subIssueCounts[issue.id] > 0) && (
+                        <span className="issue-meta-badge subissues">
+                          ⊟ {subIssueCounts[issue.id] ? `${subIssueCounts[issue.id]} sub-issue${subIssueCounts[issue.id] === 1 ? '' : 's'}` : 'Sub-issues'}
+                        </span>
+                      )}
+                      {issue.parentId && <span className="issue-meta-badge subissues">↑ {issue.parentId}</span>}
                     </div>
                   )}
                   {issue.labels.length > 0 && (

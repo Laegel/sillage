@@ -16,6 +16,8 @@ export interface Issue {
   milestone?: string
   labels: IssueLabel[]
   isSubIssue: boolean
+  // The parent's identifier (LAE-…), so the board can place a sub-issue under it.
+  parentId?: string
   hasSubIssues: boolean
   parent?: SubIssue
 }

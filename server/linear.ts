@@ -90,6 +90,7 @@ async function mapIssue(issue: SdkIssue): Promise<Issue> {
     milestone: (await issue.projectMilestone)?.name,
     labels: await mapLabels(issue),
     isSubIssue: Boolean(issue.parentId),
+    parentId: issue.parentId ? (await issue.parent)?.identifier : undefined,
     hasSubIssues: await hasChildren(issue),
   }
 }
@@ -107,7 +108,7 @@ const BOARD_QUERY = `query BoardIssues($first: Int!, $after: String) {
       state { name }
       project { id }
       projectMilestone { name }
-      parent { id }
+      parent { identifier }
       labels(first: 20) { nodes { name color } }
       children(first: 1) { nodes { id } }
     }
@@ -131,7 +132,7 @@ export interface RawBoardIssue {
   state?: { name: string } | null
   project?: { id: string } | null
   projectMilestone?: { name: string } | null
-  parent?: { id: string } | null
+  parent?: { identifier: string } | null
   labels: { nodes: { name: string; color: string }[] }
   children: { nodes: { id: string }[] }
 }
@@ -156,6 +157,7 @@ export function mapRawIssue(node: RawBoardIssue): Issue {
     milestone: node.projectMilestone?.name,
     labels: node.labels.nodes.filter((l) => !AGENT_LABEL_NAMES.has(l.name)).map((l) => ({ name: l.name, color: l.color })),
     isSubIssue: Boolean(node.parent),
+    parentId: node.parent?.identifier,
     hasSubIssues: node.children.nodes.length > 0,
   }
 }
