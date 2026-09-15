@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { cropTo } from './critic.ts'
 import { validateVisualRegion } from './project-map.ts'
-import { buildConsolidatePrompt } from './agent.ts'
+import { buildConsolidatePrompt, buildCritiquePrompt, buildDesignPrompt } from './agent.ts'
 
 let failed = 0
 function expect(label: string, actual: unknown, expected: unknown) {
@@ -32,6 +32,15 @@ expect('cropped size', execFileSync('identify', ['-format', '%w %h', png]).toStr
 
 // 4. Refine is told regions exist.
 expect('prompt mentions region', buildConsolidatePrompt('LAE-1', ['scene']).includes('"region"'), true)
+
+// 5-7. Mockups keep context (backdrop, scene, other HUD) as ignorable noise: LAE-183
+// spent 9 attempts matching a mockup's night-sky backdrop nobody asked for.
+const design = buildDesignPrompt({ projectDir: '/repo', designDir: '/repo/design/LAE-1' })
+expect('designer keeps context neutral', design.includes('data-mockup-context') && /key elements/i.test(design) && /placeholder/i.test(design), true)
+const critique = buildCritiquePrompt({ intent: 'a compass', critiqueId: 'c1' })
+expect('critic never judges context', /context placeholder/i.test(critique) && /never judge/i.test(critique), true)
+const consolidate = buildConsolidatePrompt('LAE-1', ['scene'])
+expect('refiner makes no steps for context', consolidate.includes('data-mockup-context') && /never .*step/i.test(consolidate), true)
 
 console.log(failed ? `${failed} failing` : 'all passing')
 process.exit(failed ? 1 : 0)
