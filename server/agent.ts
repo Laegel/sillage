@@ -256,6 +256,15 @@ export function buildRefineReadyRule(issueId: string): string {
 // Sent instead of buildRefinePrompt() when a chat session already exists (e.g. the
 // page was reloaded) — Sillage doesn't persist the transcript itself, so this is how
 // a reopened chat shows something instead of a blank panel.
+// The Driver's update when a card's step has used all its attempts. Without an
+// explicit stop it read "the run failed" as "retry" and re-issued implement, one
+// more attempt each time (LAE-183).
+export function buildStepExhaustedReason(p: { message: string; steps?: { failedStep?: string; lastFailure?: string } }): string {
+  const step = p.steps?.failedStep ? `Step "${p.steps.failedStep}"` : 'A step on this card'
+  const failure = p.steps?.lastFailure ? `\n\nLast failure: ${p.steps.lastFailure}` : ''
+  return `${step} has used all its attempts and is flagged for a human review. Sillage will not run it again until Val resets it. Do NOT propose implementing this card again. Release it and say why.\n\n${p.message}${failure}`
+}
+
 export const RESUME_RECAP_PROMPT = `Give me a brief recap of our discussion so far and where we left off.`
 
 // First-turn framing for an "Ideation" chat: like buildRefinePrompt(), read-only
@@ -423,7 +432,7 @@ export async function buildDriverFirstTurnPrompt({
   return `You are the driver for a repository at ${projectDir}. Your job is to keep existing Linear issues moving — deciding when to refine or implement them, and driving the engineers (refine/implement agents) doing that work through to completion. You never *mutate* Linear or the codebase directly yourself — but you have full read access to both, and should actually use it to see what's really going on rather than guessing from a one-line status alone.
 
 OWNERSHIP
-Any card you propose refine/implement/stop/restart on — or one you just created — becomes one you're responsible for watching end-to-end: you'll automatically get a status-update turn (not a real user message) whenever something relevant happens to it — a run finishes, a pull request lands, someone edits it by hand, or it looks stuck — until it reaches Done or you explicitly release it. When you get one of these turns, propose a next action for the card, release it (with a reason) if it's done or no longer worth watching, or do nothing if it just needs more time. If the status update alone doesn't tell you enough to judge what actually happened (e.g. "the run failed" with no detail, or repeated stalls with no visible progress), go check for yourself before deciding — see DIAGNOSING below. Don't conclude a run is stuck or failed just because you weren't handed the reason; look first. A refined card carries its own step-by-step plan and runs each step through its own implement-then-verify cycle on its own — you just implement/stop/restart the card as a whole and wait for its next status update, you never need to (and can't) micromanage which step it's on.
+Any card you propose refine/implement/stop/restart on — or one you just created — becomes one you're responsible for watching end-to-end: you'll automatically get a status-update turn (not a real user message) whenever something relevant happens to it — a run finishes, a pull request lands, someone edits it by hand, or it looks stuck — until it reaches Done or you explicitly release it. When you get one of these turns, propose a next action for the card, release it (with a reason) if it's done or no longer worth watching, or do nothing if it just needs more time. If the status update alone doesn't tell you enough to judge what actually happened (e.g. "the run failed" with no detail, or repeated stalls with no visible progress), go check for yourself before deciding — see DIAGNOSING below. Don't conclude a run is stuck or failed just because you weren't handed the reason; look first. A refined card carries its own step-by-step plan and runs each step through its own implement-then-verify cycle on its own — you just implement/stop/restart the card as a whole and wait for its next status update, you never need to (and can't) micromanage which step it's on. If a step has used all its attempts, the card waits for Val to reset it: never propose implementing it again — release it and say why.
 
 DIAGNOSING
 You have real tools, use them: Read/Grep/Bash (read-only — commands that inspect, not ones that write or commit) to check the repository directly (git log, git status, git diff, file contents), and the Linear MCP tools to read the issue's comments, attached PR, and current fields. This is how you find out whether an implement/refine run actually made progress, what a PR/comment says, or why something looks stalled — don't treat "I wasn't told why" as "there's no way to know."

@@ -1,5 +1,5 @@
 import type { FlowIssue } from './lib/metrics.ts'
-import type { Comment, FrictionEntry, GateProject, Issue, IssueTransition, Plan, Project, StepAttempt, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
+import type { Comment, FrictionEntry, GateProject, Step, Issue, IssueTransition, Plan, Project, StepAttempt, SubIssue, SynthesisEntry, UsageEntry } from './types.ts'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -46,6 +46,10 @@ export function updateIssue(issueId: string, payload: { title?: string; descript
     method: 'POST',
     body: JSON.stringify(payload),
   })
+}
+
+export function resetPlanStep(planId: string, stepId: string): Promise<{ step: Step }> {
+  return request(`/api/plans/${encodeURIComponent(planId)}/steps/${encodeURIComponent(stepId)}/reset`, { method: 'POST' })
 }
 
 export function fetchPlansForIssue(issueId: string): Promise<{ plans: Plan[] }> {

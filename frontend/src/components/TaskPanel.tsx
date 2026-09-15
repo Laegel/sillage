@@ -1,6 +1,9 @@
 import React from 'react'
 import type { ChatMessage, Issue, Step, SubIssue } from '../types.ts'
-import { fetchPlansForIssue, fetchSubIssues } from '../api.ts'
+
+// Mirrors MAX_STEP_ATTEMPTS in server/index.ts.
+const MAX_STEP_ATTEMPTS = 3
+import { fetchPlansForIssue, fetchSubIssues, resetPlanStep } from '../api.ts'
 import RefineChat from './RefineChat.tsx'
 
 export default function TaskPanel({
@@ -49,6 +52,7 @@ export default function TaskPanel({
   const [width, setWidth] = React.useState<'sm' | 'md' | 'lg'>('md')
   const [subIssues, setSubIssues] = React.useState<SubIssue[]>([])
   const [steps, setSteps] = React.useState<Step[]>([])
+  const [planId, setPlanId] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     setTask(issue.description || '')
@@ -68,13 +72,24 @@ export default function TaskPanel({
   }, [issue.id, issue.hasSubIssues])
 
   // Latest plan with a non-empty step list, mirroring getActivePlanForIssue on
-  // the server — read-only for now, no status flips until the Builder/Critic
-  // loop (Phase 3) actually runs steps and updates them.
-  React.useEffect(() => {
+  // the server. Re-read when a run starts or ends so attempts stay current.
+  const loadPlan = React.useCallback(() => {
     fetchPlansForIssue(issue.id)
-      .then((data) => setSteps(data.plans.find((p) => p.steps && p.steps.length > 0)?.steps || []))
+      .then((data) => {
+        const plan = data.plans.find((p) => p.steps && p.steps.length > 0)
+        setPlanId(plan?.planId ?? null)
+        setSteps(plan?.steps || [])
+      })
       .catch(() => setSteps([]))
   }, [issue.id])
+  React.useEffect(() => loadPlan(), [loadPlan, running])
+
+  // A step out of attempts waits for a human: Sillage won't run it again until reset.
+  const handleResetStep = async (stepId: string) => {
+    if (!planId) return
+    await resetPlanStep(planId, stepId)
+    loadPlan()
+  }
 
   const handleStop = () => onStop(issue.id)
   const handleRestart = () => onRestart(issue.id)
@@ -215,6 +230,17 @@ export default function TaskPanel({
               <span>
                 <span className="plan-step-title">{step.title}</span>
                 <span className="plan-step-criterion">{step.criterion}</span>
+                {step.status !== 'done' && step.attempts > 0 && (
+                  <span className={`plan-step-attempts${step.attempts >= MAX_STEP_ATTEMPTS ? ' plan-step-exhausted' : ''}`}>
+                    {step.attempts >= MAX_STEP_ATTEMPTS ? `Out of attempts (${step.attempts}) — waiting for a reset` : `Attempt ${step.attempts} of ${MAX_STEP_ATTEMPTS}`}
+                    {step.lastFailure && <span className="plan-step-failure">Last failure: {step.lastFailure}</span>}
+                  </span>
+                )}
+                {step.status !== 'done' && step.attempts >= MAX_STEP_ATTEMPTS && (
+                  <button type="button" className="plan-step-reset" onClick={() => handleResetStep(step.id)} disabled={running}>
+                    Reset attempts
+                  </button>
+                )}
               </span>
             </label>
           ))}

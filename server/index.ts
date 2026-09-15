@@ -20,6 +20,7 @@ import {
   buildRefineReadyRule,
   buildConsolidatePrompt,
   RESUME_RECAP_PROMPT,
+  buildStepExhaustedReason,
   parseClaudeChoice,
   type ClaudeChoice,
   runClaude,
@@ -48,7 +49,7 @@ import { extractElements } from './extract.ts'
 import { getFlowIssues } from './flow-metrics.ts'
 import { loadGateRuns } from './gates-store.ts'
 import { appendStepAttempt, builderFailureReason, loadStepAttempts, modelFromRunLog, type StepAttempt } from './step-metrics-store.ts'
-import { savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, getActivePlanForIssue, setStep, type Plan, type Step } from './plans-store.ts'
+import { isStepExhausted, resetStep, savePlan, markPlanApplied, getLatestUnappliedPlanForIssue, listPlansForIssue, getActivePlanForIssue, setStep, type Plan, type Step } from './plans-store.ts'
 import { appendUsage, loadUsage } from './usage-store.ts'
 import { getSynthesis, saveSynthesis, type SynthesisEntry } from './synthesis-store.ts'
 import { classifyFriction, appendFriction, loadFriction, repeatTracker, type FrictionEntry } from './friction-store.ts'
@@ -1079,13 +1080,27 @@ async function ensureDescriptionHasSteps(issueId: string, plan: Plan): Promise<v
 // done/error broadcast for the whole call, regardless of how many step
 // attempts happened inside it — every attempt runs silent for exactly that
 // reason (see startRun's own comment on `silent`).
-function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean; message: string }) => void, fresh?: boolean): void {
+// Returns false only when the card was refused outright (an exhausted step).
+function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean; message: string }) => void, fresh?: boolean): boolean {
   const plan = getActivePlanForIssue(issueId)
   if (!plan?.steps || plan.steps.length === 0) {
     runGauntlet(issueId, task, onDone, fresh)
-    return
+    return true
   }
   const steps = plan.steps
+
+  // Steps run in order, so the first unfinished step decides. Out of attempts
+  // from an earlier run, it waits for a human reset (TaskPanel / POST
+  // /api/plans/:id/steps/:stepId/reset): re-running granted one more attempt per
+  // re-issued implement — LAE-183's s2b reached 9. Refused before any Linear
+  // call: no Builder run, no new comment (the card was flagged when it ran out).
+  const next = steps.find((s) => s.status !== 'done')
+  if (next && isStepExhausted(next, MAX_STEP_ATTEMPTS)) {
+    const message = `Step "${next.title}" has used all ${next.attempts} attempts and is waiting for a human reset — not running it again.`
+    broadcast({ type: 'error', issueId, message, failure: 'step_exhausted', alreadyExhausted: true, steps: { done: steps.length - steps.filter((s) => s.status !== 'done').length, total: steps.length, failedStep: next.title, lastFailure: next.lastFailure } })
+    onDone?.({ ok: false, message })
+    return false
+  }
 
   ;(async () => {
     let projectDir: string
@@ -1126,6 +1141,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
 
     for (const step of steps) {
       if (step.status === 'done') continue // already verified in a prior runCard call
+
 
       while (true) {
         const stepFresh = usedFresh ? undefined : fresh
@@ -1192,7 +1208,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
 
         if (step.attempts >= MAX_STEP_ATTEMPTS) {
           const doneCount = steps.filter((s) => s.status === 'done').length
-          const message = `Step "${step.title}" failed verification after ${MAX_STEP_ATTEMPTS} attempts and needs a human look. Criterion: ${step.criterion}\nLast failure: ${step.lastFailure}`
+          const message = `Step "${step.title}" failed verification after ${step.attempts} attempts and needs a human look. Criterion: ${step.criterion}\nLast failure: ${step.lastFailure}`
           await flagIncomplete(issueId, message).catch((err: any) => console.error(`[runCard ${issueId}] flag-on-exhaustion failed:`, err.message))
           broadcast({ type: 'error', issueId, message, failure: 'step_exhausted', steps: { done: doneCount, total: steps.length, failedStep: step.title, lastFailure: step.lastFailure } })
           onDone?.({ ok: false, message })
@@ -1232,6 +1248,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
     broadcast({ type: 'done', issueId, exitCode: wrapUp.exitCode, summary: wrapUp.summary, steps: { done: steps.length, total: steps.length } })
     onDone?.(wrapUp)
   })()
+  return true
 }
 
 function handleStart(ws: WebSocket, payload: any) {
@@ -1246,8 +1263,7 @@ function handleStart(ws: WebSocket, payload: any) {
     return
   }
 
-  runCard(issueId, task, undefined, Boolean(payload.fresh))
-  send(ws, { type: 'started', issueId })
+  if (runCard(issueId, task, undefined, Boolean(payload.fresh))) send(ws, { type: 'started', issueId })
 }
 
 // Lets a finished run be corrected without starting over: startRun/runTask
@@ -1814,7 +1830,9 @@ const OWNERSHIP_TRIGGER_REASONS: Record<string, (payload: any) => string> = {
   },
   stopped: () => 'The implementation run was stopped.',
   error: (p) =>
-    p.summary
+    p.failure === 'step_exhausted'
+      ? buildStepExhaustedReason(p)
+      : p.summary
       ? `The run failed: ${p.message}\n\nWhat the agent said before failing:\n\n${p.summary}`
       : `The run failed: ${p.message}`,
   refine_turn_done: (p) => {
@@ -2642,6 +2660,13 @@ const server = http.createServer(async (req, res) => {
       } catch (err: any) {
         return json(res, 502, { error: `extraction failed: ${err.message}` })
       }
+    }
+    const stepResetMatch = path.match(/^\/api\/plans\/([^/]+)\/steps\/([^/]+)\/reset$/)
+    if (stepResetMatch && req.method === 'POST') {
+      const [, planId, stepId] = stepResetMatch
+      const step = resetStep(decodeURIComponent(planId), decodeURIComponent(stepId))
+      if (!step) return json(res, 404, { error: 'plan or step not found' })
+      return json(res, 200, { step })
     }
     const plansMatch = path.match(/^\/api\/plans(?:\/([^/]+)(\/apply))?$/)
     if (plansMatch) {

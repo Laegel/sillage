@@ -99,6 +99,27 @@ export function markPlanApplied(planId: string): Plan | undefined {
   return entry
 }
 
+// A step that used up its attempts waits for a human: runCard refuses to run it
+// again until it's reset, instead of granting one more attempt per re-issued
+// implement (LAE-183's s2b reached 9).
+export function isStepExhausted(step: Step, maxAttempts: number): boolean {
+  return step.status !== 'done' && step.attempts >= maxAttempts
+}
+
+// What a human reset changes: the attempt count and the last failure, nothing else.
+export function resetStepFields(step: Step): Step {
+  return { ...step, attempts: 0, lastFailure: undefined }
+}
+
+export function resetStep(planId: string, stepId: string): Step | undefined {
+  const store = loadStore()
+  const step = store[planId]?.steps?.find((s) => s.id === stepId)
+  if (!step) return undefined
+  Object.assign(step, resetStepFields(step))
+  writeFileSync(STORE_FILE, JSON.stringify(store, null, 2))
+  return step
+}
+
 export function setStep(planId: string, stepId: string, patch: Partial<Step>): void {
   const store = loadStore()
   const plan = store[planId]
