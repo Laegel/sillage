@@ -209,13 +209,20 @@ RULES FOR THIS DISCUSSION
 // project-map.ts captureParamNames), null when it has no capture command, or
 // undefined when the project couldn't be resolved. Named explicitly because a
 // refine agent left to guess wrote {"run": "<shell command>"} for LAE-183.
-export function buildConsolidatePrompt(issueId: string, captureParams?: string[] | null): string {
+export function buildConsolidatePrompt(issueId: string, captureParams?: string[] | null, stepCommandPrefix?: string[]): string {
   const captureRule =
     captureParams === null
       ? ` This project has no capture command configured, so there is no visual check available here — don't write "check":"visual" steps; use a "command" or leave the step to the verifier.`
       : captureParams
         ? ` This project's capture command takes exactly these params: ${captureParams.length ? captureParams.map((p) => `"${p}"`).join(', ') : '(none)'} — use exactly these keys, no others, each a plain string value (e.g. a scene name), never a shell command.`
         : ''
+  const prefix = stepCommandPrefix?.length ? stepCommandPrefix.join(' ') : ''
+  const prefixRule = prefix
+    ? `
+
+COMMAND ENVIRONMENT
+This project's toolchain is not on the host: Sillage runs every step command through \`${prefix}\`, and so must your dry runs — \`${prefix} bash -lc '<your command>'\`. Store the plain command (Sillage adds the prefix itself), but dry-run it this way, or you will see the environment fail rather than your command.`
+    : ''
   return `Based on our discussion so far, write a final, self-contained issue description that captures the agreed plan: the concrete goal, the approach, and any important constraints or decisions we made. Do not include meta-commentary about the discussion itself (no "we discussed" or "the user asked") — write it as the issue description should read on its own, ready for implementation. Do not write any code and do not touch git, GitHub, or Linear.
 
 If, while exploring, you identified specific existing symbols (functions, types, classes) that the implementation will need to read, extend, or reuse, add a "## Relevant symbols" section listing only the ones that actually matter (not everything you looked at), one per line, as: symbolName (path/to/file.ts) — why it matters. This lets a fresh implementation run jump straight to the right code via a symbol lookup instead of re-exploring the codebase from scratch. Omit the section entirely if nothing specific applies.
@@ -232,13 +239,13 @@ Each step needs:
   Before writing a "check":"visual" step, get real geometry instead of eyeballing the mockup yourself: \`curl -X POST http://127.0.0.1:4390/api/extract-elements -H "Content-Type: application/json" -d '{"url":"file:///absolute/path/to/mockup.html","viewport":[W,H]}'\` (viewport should match the size the mockup was designed at). This returns every visually meaningful element with its absolute position, size, and computed style. Review the list and decide which ones are genuine content worth verifying for THIS step versus incidental chrome (a decorative glow, a spacer, anything not part of the actual screen) — the same judgment you'd apply reading it by eye, just against real numbers now. Embed the survivors as "visual": {..., "candidates": [...], "viewport": [W, H]} using the extracted objects as-is (don't hand-edit their box/style fields). A step can have as few as one candidate if that's all this specific criterion is about — don't dump the whole mockup's element list onto every visual step.
 
 Before submitting, dry-run every "command" you write, right now, in this repo, exactly as written — you have Bash for this. The step isn't implemented yet, so the command is expected to fail; the point is to check it fails for the RIGHT reason:
-- If it errors on something unrelated to the feature being unbuilt yet (wrong flag, wrong path, wrong package/binary/crate name, a target that doesn't exist for a structural reason) — that's a bug in the command itself, not evidence the step is unimplemented. Fix the invocation so it's actually correct for this repo, then dry-run the fix too. Don't drop to no-command just because the first attempt didn't run — only omit "command" if you truly cannot construct one that works.
+- If it errors on something unrelated to the feature being unbuilt yet (wrong flag, wrong path, wrong package/binary/crate name, a target that doesn't exist for a structural reason), or on the environment rather than your command (a package manager refusing to run, a missing toolchain, a container not reachable) — that's a bug in the command itself, not evidence the step is unimplemented. Fix the invocation so it's actually correct for this repo, then dry-run the fix too. Don't drop to no-command just because the first attempt didn't run — only omit "command" if you truly cannot construct one that works.
 - If it fails because the specific thing it checks (a new assertion, a new file, a new symbol) genuinely doesn't exist yet — that's correct and expected. Leave it as-is.
 - If it unexpectedly PASSES despite the feature obviously not existing yet, that is the actual red flag, not a good sign — it usually means the command isn't exercising the thing you think it is (e.g. a test-name filter that matches zero tests exits 0 having tested nothing). Rewrite it to target something that will only become true once the step is genuinely done.
 
 Store the plain command you'd type by hand — plain \`grep\`/\`cargo\`/\`npm\`/etc, no wrapper prefixes. If your own shell environment silently rewrites what you type (a proxy, a hook, an alias) before it actually runs, that rewritten form is specific to this session, not portable — the command will be replayed later by a plain, non-interactive shell that won't have the same rewriting, so store what you literally wrote, not what you observed actually executing.
 
-Only call curl once, after you've written the final description text (used as "content" above).`
+Only call curl once, after you've written the final description text (used as "content" above).${prefixRule}`
 }
 
 // Reminder appended to EVERY refine turn (first turn via buildRefinePrompt's rule

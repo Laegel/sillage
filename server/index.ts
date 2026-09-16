@@ -31,7 +31,7 @@ import {
   runMockAgent,
   SILLAGE_ROOT,
 } from './agent.ts'
-import { captureConfigFor, captureParamNames, checkRequiredTools, mappedProjects, resolveProjectDir, supportsWorktrees, validateCaptureParams, validateVisualRegion, type CaptureConfig } from './project-map.ts'
+import { captureConfigFor, captureParamNames, checkRequiredTools, mappedProjects, resolveProjectDir, stepCommandPrefixFor, supportsWorktrees, validateCaptureParams, validateVisualRegion, type CaptureConfig } from './project-map.ts'
 import {
   captureRound,
   CaptureSideFailure,
@@ -1002,6 +1002,16 @@ async function captureConfigForIssue(issueId: string): Promise<CaptureConfig | u
   return captureConfigFor(basename(resolveProjectDir(issue.project)))
 }
 
+// For the consolidation prompt: the argv the project's step commands run through.
+async function stepCommandPrefixForIssue(issueId: string): Promise<string[] | undefined> {
+  try {
+    const issue = await linear.getIssue(issueId)
+    return stepCommandPrefixFor(basename(resolveProjectDir(issue.project)))
+  } catch {
+    return undefined
+  }
+}
+
 // For the consolidation prompt: the exact param keys, null when the project has
 // no capture command, undefined when the lookup itself failed (prompt stays generic).
 async function captureParamNamesForIssue(issueId: string): Promise<string[] | null | undefined> {
@@ -1495,7 +1505,7 @@ function runRefine(
         // Deferred past this run's own `finally` (which hasn't executed yet —
         // we're still inside its `try` block) so the busy-check in runRefine
         // doesn't reject it as already-active.
-        queueMicrotask(() => runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId)), undefined, true, true))
+        queueMicrotask(() => runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId), await stepCommandPrefixForIssue(issueId)), undefined, true, true))
       }
       onDone?.({ ok: true, message: trimmedSummary || 'refine turn complete (no text output)' })
     } catch (err: any) {
@@ -1536,7 +1546,7 @@ function handleRefineMessage(ws: WebSocket, payload: any) {
 function handleRefineConsolidate(ws: WebSocket, payload: any) {
   const issueId = payload.issueId
   if (!issueId) return send(ws, { type: 'error', message: 'issueId is required' })
-  const started = runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId)), undefined, true)
+  const started = runRefine(issueId, async () => buildConsolidatePrompt(issueId, await captureParamNamesForIssue(issueId), await stepCommandPrefixForIssue(issueId)), undefined, true)
   if (!started) rejectBusy(ws, { issueId }, 'A refine turn is already running for this issue')
 }
 

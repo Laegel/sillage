@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { cropTo } from './critic.ts'
-import { validateVisualRegion } from './project-map.ts'
+import { stepCommandArgv, stepCommandPrefixFor, validateVisualRegion } from './project-map.ts'
 import { buildConsolidatePrompt, buildCritiquePrompt, buildDesignPrompt } from './agent.ts'
 
 let failed = 0
@@ -33,6 +33,12 @@ expect('cropped size', execFileSync('identify', ['-format', '%w %h', png]).toStr
 // 4. Refine is told regions exist.
 expect('prompt mentions region', buildConsolidatePrompt('LAE-1', ['scene']).includes('"region"'), true)
 
+// 12-13. Step commands run through a project's prefix, and a broken environment is not a missing feature.
+const withPrefix = buildConsolidatePrompt('LAE-1', ['scene'], ['docker', 'compose', 'exec', '-T', 'app'])
+expect('prompt names the command prefix', withPrefix.includes('docker compose exec -T app'), true)
+expect('prompt separates env failure from missing feature', /environment|toolchain/i.test(withPrefix), true)
+expect('no prefix, no prefix rule', buildConsolidatePrompt('LAE-1', ['scene']).includes('docker compose exec'), false)
+
 // 5-7. Mockups keep context (backdrop, scene, other HUD) as ignorable noise: LAE-183
 // spent 9 attempts matching a mockup's night-sky backdrop nobody asked for.
 const design = buildDesignPrompt({ projectDir: '/repo', designDir: '/repo/design/LAE-1' })
@@ -41,6 +47,17 @@ const critique = buildCritiquePrompt({ intent: 'a compass', critiqueId: 'c1' })
 expect('critic never judges context', /context placeholder/i.test(critique) && /never judge/i.test(critique), true)
 const consolidate = buildConsolidatePrompt('LAE-1', ['scene'])
 expect('refiner makes no steps for context', consolidate.includes('data-mockup-context') && /never .*step/i.test(consolidate), true)
+
+// 8-11. A project whose toolchain lives in a container runs step commands there:
+// on the host, songe's pnpm aborts (node_modules records the container's store).
+expect('no prefix runs as before', stepCommandArgv(undefined, 'pnpm test'), { file: 'bash', args: ['-lc', 'pnpm test'] })
+expect('empty prefix runs as before', stepCommandArgv([], 'pnpm test'), { file: 'bash', args: ['-lc', 'pnpm test'] })
+expect('prefix wraps the command', stepCommandArgv(['docker', 'compose', 'exec', '-T', 'app'], 'pnpm test'), {
+  file: 'docker',
+  args: ['compose', 'exec', '-T', 'app', 'bash', '-lc', 'pnpm test'],
+})
+expect('songe runs step commands in its container', stepCommandPrefixFor('songe'), ['docker', 'compose', 'exec', '-T', 'app'])
+expect('ldaahbevy runs them on the host', stepCommandPrefixFor('ldaahbevy'), undefined)
 
 console.log(failed ? `${failed} failing` : 'all passing')
 process.exit(failed ? 1 : 0)

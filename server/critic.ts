@@ -5,7 +5,7 @@ import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { buildCritiquePrompt, buildVerifyPrompt, runClaude, SILLAGE_ROOT } from './agent.ts'
 import { extractElementsAndScreenshot, type ExtractedElement } from './extract.ts'
-import { captureConfigFor, captureParamNames, isDomInspectable, validateCaptureParams, type CaptureConfig } from './project-map.ts'
+import { captureConfigFor, captureParamNames, isDomInspectable, stepCommandArgv, stepCommandPrefixFor, validateCaptureParams, type CaptureConfig } from './project-map.ts'
 import type { AgentEvent } from './types.ts'
 
 const execFileAsync = promisify(execFile)
@@ -682,7 +682,8 @@ export async function verifyStep(
 
   if (step.command) {
     try {
-      const { stdout, stderr } = await execFileAsync('bash', ['-lc', step.command], {
+      const { file, args } = stepCommandArgv(stepCommandPrefixFor(basename(projectDir)), step.command)
+      const { stdout, stderr } = await execFileAsync(file, args, {
         cwd: projectDir,
         timeout: 600_000,
         maxBuffer: 10 * 1024 * 1024,

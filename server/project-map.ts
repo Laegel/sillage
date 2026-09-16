@@ -37,6 +37,10 @@ interface ProjectMapFile {
   PROJECTS_ROOT: string
   projects: Record<string, string>
   requiredTools?: Record<string, string[]>
+  // argv a project's step commands run through, for a toolchain that isn't on
+  // the host. songe's node_modules records the container's pnpm store, so a
+  // host `pnpm test` there aborts trying to purge and reinstall it.
+  stepCommandPrefix?: Record<string, string[]>
   capture?: Record<string, CaptureConfig>
   // true means the orchestrator will NOT serialize implement runs on this
   // project — it does NOT mean per-run git worktrees are actually provisioned
@@ -138,6 +142,18 @@ export async function checkRequiredTools(folder: string): Promise<void> {
   if (missing.length > 0) {
     throw new Error(`Missing required tool(s) for ${folder}: ${missing.join(', ')}. Install them or update project-map.json.`)
   }
+}
+
+export function stepCommandPrefixFor(folder: string): string[] | undefined {
+  const prefix = loadMap().stepCommandPrefix?.[folder]
+  return prefix && prefix.length > 0 ? prefix : undefined
+}
+
+// How verifyStep spawns a step's command: bash -lc, optionally inside the
+// project's prefix (e.g. docker compose exec).
+export function stepCommandArgv(prefix: string[] | undefined, command: string): { file: string; args: string[] } {
+  if (!prefix || prefix.length === 0) return { file: 'bash', args: ['-lc', command] }
+  return { file: prefix[0], args: [...prefix.slice(1), 'bash', '-lc', command] }
 }
 
 // undefined means "this project has no capture command configured" — the
