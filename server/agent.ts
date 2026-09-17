@@ -1037,15 +1037,23 @@ function toolCallEventFromOpencode(part: any): AgentEvent | null {
 // "tool_use" types, same part.state shape), so all three share one stream parser.
 // onProperOutput fires once, the first time real text/tool output is seen — runFree
 // uses it to decide whether OpenCode is actually alive or needs to be abandoned.
+// OpenCode and Kilo close a finished run with step_finish reason "stop". Any other
+// last reason — "unknown" (an empty model turn), "length", or "tool-calls" (killed
+// mid-run) — means the Builder never finished, however long it worked.
+export function runEndedCleanly(lastFinishReason: string | undefined): boolean {
+  return lastFinishReason === 'stop'
+}
+
 function attachOpencodeFamilyStream(
   target: { proc: ChildProcess; logFile: string } | { pid: number; logFile: string },
   backend: 'opencode' | 'kilocode',
   onOutput: (event: AgentEvent) => void,
   onProperOutput: () => void,
   onSessionId?: (id: string) => void,
-): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean }> {
+): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; endReason?: string }> {
   return new Promise((resolve, reject) => {
     let sawText = false
+    let lastFinishReason: string | undefined
     let sawSessionId = false
     let settled = false
     let stderrText = ''
@@ -1065,6 +1073,7 @@ function attachOpencodeFamilyStream(
           sawSessionId = true
           onSessionId(msg.sessionID)
         }
+        if (msg.type === 'step_finish') lastFinishReason = msg.part?.reason
         if (msg.type === 'text' && msg.part?.text) {
           onOutput({ kind: 'text', text: msg.part.text })
           if (!sawText) onProperOutput()
@@ -1112,7 +1121,11 @@ function attachOpencodeFamilyStream(
       // emitting a single parseable line (a transient upstream hiccup on its
       // free-tier model), which previously slipped through as "done" with a
       // permanently empty message and no error surfaced anywhere.
-      const needsFallback = !sawText
+      // Output alone isn't finishing: LAE-219's Builder worked 111 minutes, then its
+      // last model turn came back empty and opencode exited as if done.
+      const incomplete = sawText && !runEndedCleanly(lastFinishReason)
+      const needsFallback = !sawText || incomplete
+      if (incomplete) onOutput({ kind: 'orchestrator', text: `${backend === 'kilocode' ? 'Kilo Code' : 'OpenCode'} exited without finishing its run (last turn: ${lastFinishReason ?? 'none'}).` })
       if (/Rate limit exceeded/i.test(stderrText)) rateLimited = true
       if (needsFallback && stderrText) onOutput({ kind: 'orchestrator', text: `stderr: ${stderrText}` })
       if (rateLimited) {
@@ -1122,7 +1135,7 @@ function attachOpencodeFamilyStream(
           detail: `${backend === 'kilocode' ? 'Kilo Code' : 'OpenCode'} hit "Rate limit exceeded" — wait for the quota to reset or switch backend.`,
         })
       }
-      resolve({ exitCode, needsFallback, rateLimited })
+      resolve({ exitCode, needsFallback, rateLimited, endReason: incomplete ? lastFinishReason ?? 'none' : undefined })
     }
 
     const stopTail = tailLines(target.logFile, handleLine)
@@ -1235,7 +1248,7 @@ async function runFreeAttempt(
   readOnly: boolean | undefined,
   onOutput: (event: AgentEvent) => void,
   onProcess?: (proc: ChildProcess, logFile: string, backend: 'claude' | 'opencode' | 'kilocode' | 'mock') => void,
-): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; stalled: boolean; sessionId?: string }> {
+): Promise<{ exitCode: number | null; needsFallback: boolean; rateLimited: boolean; stalled: boolean; endReason?: string; sessionId?: string }> {
   const logFile = openRunLog(backend, sessionId ?? randomUUID())
   const proc = await spawnFn(prompt, projectDir, logFile, sessionId, readOnly)
   onProcess?.(proc, logFile, backend)
@@ -1322,6 +1335,8 @@ export async function runFree({
     category: 'backend_fallback',
     detail: primary.stalled
       ? `OpenCode went silent mid-run (no output for ${STALL_TIMEOUT_MS / 60_000} min) — falling back to Kilo Code.`
+      : primary.endReason
+      ? `OpenCode exited without finishing its run (last turn: ${primary.endReason}) — falling back to Kilo Code.`
       : `OpenCode produced no output within ${FREE_FALLBACK_TIMEOUT_MS / 1000}s (likely the daily free-tier quota is exhausted) — falling back to Kilo Code.`,
   })
   const fallback = await runFreeAttempt(spawnKilocode, 'kilocode', prompt, projectDir, undefined, readOnly, onOutput, onProcess)

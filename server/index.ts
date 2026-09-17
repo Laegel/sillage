@@ -45,7 +45,7 @@ import {
   type CaptureRoundResult,
   type Verdict,
 } from './critic.ts'
-import { deleteChatSession, getChatSession, saveChatSession, type ChatBackend } from './chat-store.ts'
+import { deleteChatSession, getChatSession, implementSessionKey, saveChatSession, type ChatBackend } from './chat-store.ts'
 import { extractElements } from './extract.ts'
 import { getFlowIssues } from './flow-metrics.ts'
 import { loadGateRuns } from './gates-store.ts'
@@ -521,6 +521,7 @@ async function runTask({
   fresh,
   openPr,
   requireChanges,
+  sessionScope,
 }: {
   issueId: string
   task: string
@@ -538,6 +539,8 @@ async function runTask({
   // real step already committed everything, so "no changes" must not read
   // as stuck for that one call.
   requireChanges?: boolean
+  // A plan step's id: its Builder session is kept apart from other steps' (implementSessionKey).
+  sessionScope?: string
 }) {
   const issue = await linear.getIssue(issueId)
 
@@ -581,7 +584,7 @@ async function runTask({
     // Keyed separately from refine's plain `issueId` key (chat-store.ts) — a
     // refine turn's read-only session and an implement run's writing session
     // for the same issue must never collide under one entry.
-    const sessionKey = `implement:${issueId}`
+    const sessionKey = implementSessionKey(issueId, sessionScope)
     const existing = fresh ? undefined : getChatSession(sessionKey)
 
     const before = await gitSnapshot(projectDir)
@@ -730,6 +733,7 @@ function startRun(
   silent?: boolean,
   openPr?: boolean,
   requireChanges?: boolean,
+  sessionScope?: string,
 ) {
   const state: ActiveState = { issueId, task, events: [], done: false, proc: null, stopped: false, pendingRestart: false, lastEventAt: Date.now() }
   active.set(issueId, state)
@@ -745,6 +749,7 @@ function startRun(
     fresh,
     openPr,
     requireChanges,
+    sessionScope,
     onOutput: (event) => {
       state.events.push(event)
       state.lastEventAt = Date.now()
@@ -790,7 +795,7 @@ function startRun(
       // stopped path above never sets it), so it resolves with an explicit
       // "stopped before completion" rather than silently never settling.
       if (state.pendingRestart) {
-        startRun(issueId, state.task, onDone, undefined, silent, openPr, requireChanges)
+        startRun(issueId, state.task, onDone, undefined, silent, openPr, requireChanges, sessionScope)
       } else {
         onDone?.({ ...(outcome ?? { ok: false, message: 'run was stopped before it completed' }), ...spawned })
       }
@@ -986,8 +991,8 @@ function runGauntlet(issueId: string, task: string, onDone?: (result: { ok: bool
 // one level finer.
 const MAX_STEP_ATTEMPTS = 3
 
-function runCardAttempt(issueId: string, task: string, fresh: boolean | undefined, openPr: boolean, requireChanges: boolean): Promise<StartRunResult> {
-  return new Promise((resolve) => startRun(issueId, task, resolve, fresh, true, openPr, requireChanges))
+function runCardAttempt(issueId: string, task: string, fresh: boolean | undefined, openPr: boolean, requireChanges: boolean, sessionScope?: string): Promise<StartRunResult> {
+  return new Promise((resolve) => startRun(issueId, task, resolve, fresh, true, openPr, requireChanges, sessionScope))
 }
 
 // Frames one step as its own self-contained task — "step N of M" plus the
@@ -1159,7 +1164,7 @@ function runCard(issueId: string, task: string, onDone?: (result: { ok: boolean;
         usedFresh = true
 
         const builderStartedAt = Date.now()
-        const result = await runCardAttempt(issueId, buildStepTask(step, steps.indexOf(step) + 1, steps.length, task), stepFresh, false, true)
+        const result = await runCardAttempt(issueId, buildStepTask(step, steps.indexOf(step) + 1, steps.length, task), stepFresh, false, true, step.id)
         const attemptRow = {
           phase: 'step' as const,
           stepId: step.id,
